@@ -1,6 +1,7 @@
 import math
 import random
 import sys
+import wave
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,10 +9,15 @@ from pathlib import Path
 import arcade
 from PIL import Image
 
+from settings import Preferences, WINDOW_SIZES
+
 SIZE = 3200
-WIDTH, HEIGHT = 1200, 760
+WIDTH, HEIGHT = WINDOW_SIZES[1]
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
-COLORS = [(99,222,232), (246,189,103), (198,155,248), (146,214,154)]
+COLORS = [(99,239,239), (255,213,92), (221,158,255)]
+ACID_COLOR = (175,255,92)
+CALL_COLOR = (244,147,252)
+SOUNDS = ("shot", "reload", "pickup", "hit", "wave", "spit", "call", "dash")
 NUMBERS = (arcade.key.KEY_1, arcade.key.KEY_2, arcade.key.KEY_3)
 
 
@@ -23,9 +29,31 @@ def distance(a, b):
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
+def fitted_window(index, screen_width, screen_height):
+    width, height = WINDOW_SIZES[index]
+    scale = min(1, screen_width/width, max(405,screen_height-80)/height)
+    return max(640,int(width*scale)), max(405,int(height*scale))
+
+
 def view_size(width, height):
     scale = min(max(1, width)/1080, max(1, height)/HEIGHT)
     return max(1, width)/scale, max(1, height)/scale
+
+
+def circle_entry(x, y, dx, dy, target):
+    zx, zy = x-target.x, y-target.y
+    length_sq = dx*dx + dy*dy
+    offset = zx*zx + zy*zy - target.radius*target.radius
+    if offset <= 0:
+        return 0
+    if not length_sq:
+        return math.inf
+    projection = zx*dx + zy*dy
+    discriminant = projection*projection - length_sq*offset
+    if discriminant < 0:
+        return math.inf
+    entry = (-projection-math.sqrt(discriminant))/length_sq
+    return entry if 0 <= entry <= 1 else math.inf
 
 
 def box(x, y, w, h, color):
@@ -91,6 +119,9 @@ UPGRADES = (
     ("Бронежилет", "На 15% меньше получаемого урона"),
     ("Полевой медик", "+1 здоровье в секунду вне контакта"),
     ("Длинные магазины", "+4 патрона к ёмкости магазина"),
+    ("Второе дыхание", "+20 к максимуму здоровья"),
+    ("Быстрый рывок", "На 20% короче откат рывка"),
+    ("Дальнобойные пули", "+30% к дальности выстрелов"),
 )
 
 
@@ -104,6 +135,7 @@ class Fighter:
     magazine: int
     reserve: int = 100
     hp: float = 100
+    max_hp: int = 100
     cooldown: float = 0
     reload: float = 0
     angle: float = 0
@@ -136,6 +168,7 @@ class Zombie:
     angle: float = 0
     stride: float = 0
     walking: bool = False
+    called: bool = False
 
 
 @dataclass
@@ -191,13 +224,19 @@ COVER_TYPES = {
     "Клумба": ((80,150), (56,84), "planter"),
     "Блокпост": ((100,145), (85,116), "checkpoint"),
 }
-ZOMBIE_ART = ("walker", "runner", "armored", "charger", "boss")
+ZOMBIE_ART = ("walker", "runner", "armored", "charger", "boss", "spitter", "caller")
+PALETTES = (
+    ("Дневной парк", "", (134,151,166), (239,216,126), (160,184,176)),
+    ("Янтарный квартал", "_ochre", (158,144,154), (255,209,140), (207,179,153)),
+    ("Северный сектор", "_blue", (115,144,181), (183,228,237), (163,192,217)),
+)
 ASSET_NAMES = (
     "player_idle", "player_walk",
     *(f"{kind}_{frame}" for kind in ZOMBIE_ART for frame in range(3)),
     *(weapon.sprite for weapon in WEAPONS[:1] + CACHE_WEAPONS),
     *(sprite for _, _, sprite in COVER_TYPES.values()),
-    "supply", "ammo", "bullet", "casing", "ground", "asphalt", "concrete",
+    "supply", "ammo", "bullet", "casing",
+    *(base+suffix for _, suffix, *_ in PALETTES for base in ("ground", "asphalt", "concrete")),
 )
 
 
@@ -268,6 +307,7 @@ class Arena:
         self.road = 118
         self.plaza = 158
         rng = random.Random(seed if generated else 104)
+        self.palette = rng.choice(PALETTES) if generated else PALETTES[0]
         if generated:
             self.generate(rng)
 
@@ -381,12 +421,12 @@ class MenuButton:
 class Game(arcade.Window):
     def __init__(self):
         self.switching_display = False
-        self.screen_path = Path.home() / ".arcade-zone04-display"
-        try:
-            full = self.screen_path.read_text().strip() == "fullscreen"
-        except (OSError, UnicodeError):
-            full = False
-        super().__init__(WIDTH, HEIGHT, "Зона 04 / Карантин", resizable=True, fullscreen=full)
+        directory = Path.home()
+        self.settings_path = directory / ".arcade-zone04-settings.json"
+        self.preferences = Preferences.load(self.settings_path, directory / ".arcade-zone04-display")
+        width, height = fitted_window(self.preferences.window_size_index, *arcade.get_display_size())
+        super().__init__(width, height, "Зона 04 / Карантин", resizable=True,
+                         fullscreen=self.preferences.fullscreen)
         self.set_minimum_size(640, 405)
         self.view_width, self.view_height = view_size(*self.get_size())
         self.game_camera = arcade.Camera2D(
@@ -394,13 +434,15 @@ class Game(arcade.Window):
         )
         self.art = load_art()
         self.player_models = load_player_models(self.art)
-        self.best_path = Path.home() / ".arcade-zone04-best"
+        self.best_path = directory / ".arcade-zone04-best"
+        self.sounds = {}
+        self.settings_return = "title"
         try:
             self.best = int(self.best_path.read_text())
         except (OSError, ValueError):
             self.best = 0
         self.labels = {}
-        self.difficulty = 1
+        self.difficulty = self.preferences.difficulty
         self.pointer_ratio = (.65, .5)
         self.cursor_hidden = False
         self.reset()
@@ -413,7 +455,7 @@ class Game(arcade.Window):
         self.keys = set()
 
         self.firing = False
-        self.zombies, self.shots, self.loot, self.sparks, self.casings = [], [], [], [], []
+        self.zombies, self.shots, self.loot, self.sparks, self.casings, self.acid = [], [], [], [], [], []
         self.state = "play"
         self.match_time = 0
         self.wave = self.spawn_left = self.kills = self.xp = 0
@@ -427,6 +469,8 @@ class Game(arcade.Window):
         self.regeneration = 0
         self.armor = 1
         self.magazine_bonus = 0
+        self.dash_cooldown = 2.4
+        self.shot_range = 1.0
         self.armory = random.sample(CACHE_WEAPONS, len(CACHE_WEAPONS))
 
     @property
@@ -454,7 +498,20 @@ class Game(arcade.Window):
     def capacity(self, fighter):
         return fighter.weapon.capacity + self.magazine_bonus
 
+    def sound(self, name, gain=1):
+        if not self.preferences.volume:
+            return
+        try:
+            if name not in self.sounds:
+                self.sounds[name] = arcade.load_sound(ASSET_DIR / f"{name}.wav")
+            if self.sounds[name] is not None:
+                arcade.play_sound(self.sounds[name], self.preferences.volume*gain/100)
+        except (OSError, RuntimeError):
+            self.sounds[name] = None
+
     def burst(self, x, y, color, count):
+        if not self.preferences.effects:
+            return
         for _ in range(count):
             angle = random.uniform(0, math.tau)
             speed = random.uniform(30, 150)
@@ -475,12 +532,14 @@ class Game(arcade.Window):
         x, y = fighter.x, fighter.y
         self.arena.move(fighter, dx*160, dy*160, 145)
         if math.hypot(x-fighter.x, y-fighter.y) > 1:
-            fighter.dash_ready = self.match_time + 2.4
+            fighter.dash_ready = self.match_time + self.dash_cooldown
+            self.sound("dash")
             self.burst(x, y, fighter.color, 14)
 
     def reload_weapon(self, fighter):
         if fighter.reload <= 0 and fighter.magazine < self.capacity(fighter) and fighter.reserve:
             fighter.reload = fighter.weapon.reload_time/self.reload_speed
+            self.sound("reload")
 
     def fire(self, fighter):
         if fighter.cooldown > 0 or fighter.reload > 0:
@@ -489,18 +548,20 @@ class Game(arcade.Window):
             self.reload_weapon(fighter)
             return
         fighter.magazine -= 1
+        self.sound("shot", .82)
         weapon = fighter.weapon
         fighter.cooldown = weapon.interval / self.fire_rate
         fighter.muzzle_flash = .065
         fighter.shot_angle = fighter.angle
         dx, dy = math.cos(fighter.angle), math.sin(fighter.angle)
         muzzle_x, muzzle_y = weapon.muzzle*dx, weapon.muzzle*dy
-        self.casings.append(Casing(fighter.x+14*dx, fighter.y+14*dy, 82*dy, -82*dx, fighter.angle))
+        if self.preferences.effects:
+            self.casings.append(Casing(fighter.x+14*dx, fighter.y+14*dy, 82*dy, -82*dx, fighter.angle))
         for spread in weapon.spread:
             angle = fighter.angle + spread
             self.shots.append(Shot(
                 fighter.x, fighter.y, weapon.velocity*math.cos(angle), weapon.velocity*math.sin(angle),
-                weapon.damage*self.damage, weapon.flight_time, muzzle_x, muzzle_y,
+                weapon.damage*self.damage, weapon.flight_time*self.shot_range, muzzle_x, muzzle_y,
             ))
 
     def nearby(self, weapon):
@@ -516,6 +577,7 @@ class Game(arcade.Window):
         item = self.nearby(swap)
         if item is None:
             return
+        self.sound("pickup")
         f = self.player
         if swap:
             f.weapon,item.weapon = item.weapon,f.weapon
@@ -531,8 +593,9 @@ class Game(arcade.Window):
             if item.weapon is None:
                 self.loot.remove(item)
             if item.heal:
-                f.hp = min(100, f.hp+item.heal)
-                self.notify(f"Припасы дают {amount} патронов и {item.heal} здоровья")
+                healed = min(item.heal, f.max_hp-f.hp)
+                f.hp += healed
+                self.notify(f"+{amount} патронов   ·   +{math.ceil(healed)} здоровья")
             else:
                 self.notify(f"+{amount} патронов")
 
@@ -568,11 +631,15 @@ class Game(arcade.Window):
         hp = (36+4*self.wave)*self.rules.health
         if boss:
             zombie = Zombie(x,y,hp*7,83,34,(229,126,82),boss=True,kind="boss")
-        elif self.wave >= (6 if self.difficulty == 0 else 4) and roll < .21:
+        elif self.wave >= 6 and roll < .13:
+            zombie = Zombie(x,y,hp*1.12,90,17,CALL_COLOR,kind="caller")
+        elif self.wave >= 4 and roll < (.26 if self.wave >= 6 else .13):
+            zombie = Zombie(x,y,hp*.93,96,16,ACID_COLOR,kind="spitter")
+        elif self.wave >= (6 if self.difficulty == 0 else 4) and roll < (.38 if self.wave >= 6 else .25):
             zombie = Zombie(x,y,hp*1.25,110,17,(219,140,93),kind="charger")
-        elif self.wave >= (3 if self.difficulty == 0 else 2) and roll < .42:
+        elif self.wave >= (3 if self.difficulty == 0 else 2) and roll < (.51 if self.wave >= 4 else .38):
             zombie = Zombie(x,y,hp*1.65,70,22,(125,150,169),kind="armored",armor=hp*.8)
-        elif self.wave >= (1 if self.difficulty == 2 else 2) and roll < .67:
+        elif self.wave >= (1 if self.difficulty == 2 else 2) and roll < (.74 if self.wave >= 4 else .62):
             zombie = Zombie(x,y,hp*.68,156,13,(202,111,100),kind="runner")
         else:
             zombie = Zombie(x,y,hp,random.uniform(75,112),16,(143,172,104))
@@ -591,6 +658,7 @@ class Game(arcade.Window):
             self.break_time -= dt
             if self.break_time <= 0:
                 self.wave += 1
+                self.sound("wave", .7)
                 if self.wave > 1:
                     self.drop_supplies()
                 if self.wave % 2 == 0:
@@ -640,7 +708,7 @@ class Game(arcade.Window):
         p.muzzle_flash = max(0, p.muzzle_flash-dt)
         p.hurt = max(0, p.hurt-dt)
         if not p.hurt:
-            p.hp = min(100, p.hp+self.regeneration*dt)
+            p.hp = min(p.max_hp, p.hp+self.regeneration*dt)
         if p.reload > 0:
             p.reload -= dt
             if p.reload <= 0:
@@ -679,20 +747,11 @@ class Game(arcade.Window):
 
     def projectile_hit(self, shot, ex, ey):
         dx, dy = ex-shot.x, ey-shot.y
-        length_sq = dx*dx + dy*dy
         wall_at, cover = self.arena.obstruction(shot.x, shot.y, ex, ey)
         hit, hit_at = None, wall_at
         for z in self.zombies:
-            zx, zy = shot.x-z.x, shot.y-z.y
-            projection = zx*dx + zy*dy
-            offset = zx*zx + zy*zy - z.radius*z.radius
-            discriminant = projection*projection - length_sq*offset
-            if discriminant < 0:
-                continue
-            root = math.sqrt(discriminant)
-            entry = max(0, (-projection-root)/length_sq)
-            exit_at = (-projection+root)/length_sq
-            if exit_at >= 0 and entry <= 1 and entry < hit_at:
+            entry = circle_entry(shot.x, shot.y, dx, dy, z)
+            if entry < hit_at:
                 hit, hit_at = z, entry
         if hit is None and cover is None:
             return False
@@ -716,19 +775,64 @@ class Game(arcade.Window):
         return True
 
     def hurt_player(self, amount):
+        self.sound("hit", .86)
         self.player.hp -= amount * self.rules.damage * self.armor
         self.player.hurt = 1.5
         if self.player.hp <= 0:
             self.end_match()
 
+    def update_acid(self, dt):
+        p = self.player
+        remaining = []
+        for droplet in self.acid:
+            travel = min(dt, droplet.life)
+            dx, dy = droplet.vx*travel, droplet.vy*travel
+            x, y = droplet.x, droplet.y
+            ex, ey = x+dx, y+dy
+            wall_at, _ = self.arena.obstruction(x,y,ex,ey)
+            hit_at = circle_entry(x,y,dx,dy,p)
+            if hit_at < wall_at:
+                self.burst(x+dx*hit_at,y+dy*hit_at,ACID_COLOR,8)
+                self.hurt_player(droplet.damage)
+                if self.state == "over":
+                    remaining.clear()
+                    break
+            elif wall_at < math.inf:
+                self.burst(x+dx*wall_at,y+dy*wall_at,ACID_COLOR,6)
+            else:
+                droplet.x, droplet.y = ex,ey
+                droplet.life -= travel
+                if droplet.life > 0 and 0 < ex < SIZE and 0 < ey < SIZE:
+                    remaining.append(droplet)
+        self.acid = remaining
+
+    def call_runners(self, zombie, reinforcements):
+        self.sound("call", .7)
+        self.burst(zombie.x,zombie.y,CALL_COLOR,21)
+        zombie.called = True
+        for direction in (zombie.heading+1.7, zombie.heading-1.7):
+            for turn in (0,.6,-.6,1.2,-1.2):
+                x = zombie.x+math.cos(direction+turn)*52
+                y = zombie.y+math.sin(direction+turn)*52
+                if (15 < x < SIZE-15 and 15 < y < SIZE-15
+                        and math.hypot(x-self.player.x,y-self.player.y) > self.player.radius+15
+                        and not self.arena.blocked(x,y,15)):
+                    hp = (36+4*self.wave)*self.rules.health*.42
+                    reinforcements.append(Zombie(x,y,hp,152*self.rules.speed,13,(221,128,154),kind="runner"))
+                    break
+
     def update_zombies(self, dt):
         target = self.player
+        reinforcements = []
         for z in self.zombies:
             z.walking = False
             z.flash = max(0,z.flash-dt)
             gap = distance(z,target)
             clear = self.arena.obstruction(z.x,z.y,target.x,target.y)[1] is None
             reach = z.radius + 26
+            charger = z.kind in ("charger","boss")
+            caller = z.kind == "caller" and not z.called and len(self.zombies)+len(reinforcements) < 90
+            spitter = z.kind == "spitter"
             if z.charge > 0:
                 z.charge = max(0,z.charge-dt)
                 dx,dy = math.cos(z.heading),math.sin(z.heading)
@@ -748,18 +852,31 @@ class Game(arcade.Window):
             if z.windup > 0:
                 z.windup = max(0,z.windup-dt)
                 if not z.windup:
-                    z.attack_ready = self.match_time + (2.5 if z.kind in ("charger","boss") else .7)
-                    if z.kind in ("charger","boss"):
+                    z.attack_ready = self.match_time + (2.5 if charger or spitter else .7)
+                    if charger:
                         z.charge = .44
+                    elif spitter:
+                        speed = 425
+                        self.acid.append(Shot(z.x,z.y,speed*math.cos(z.heading),speed*math.sin(z.heading),18,1.02))
+                        self.sound("spit", .65)
+                    elif caller:
+                        self.call_runners(z, reinforcements)
                     elif gap <= reach and clear:
                         self.hurt_player(15 if z.kind == "armored" else 10)
                         if self.state == "over":
                             return
                 continue
-            attack_range = 145 if z.kind in ("charger","boss") else reach
+            if spitter or caller:
+                attack_range = 320
+                telegraph = .56 if spitter else .84
+            else:
+                attack_range = 145 if charger else reach
+                telegraph = .55 if charger else .22
             if gap <= attack_range and clear and self.match_time >= z.attack_ready:
-                z.windup = .55 if z.kind in ("charger","boss") else .22
+                z.windup = telegraph
                 z.heading = z.angle = math.atan2(target.y-z.y,target.x-z.x)
+                continue
+            if spitter and clear and 100 < gap <= attack_range:
                 continue
             if gap <= reach-8 and clear:
                 continue
@@ -773,6 +890,7 @@ class Game(arcade.Window):
                         dy += ry*1.3
             if self.arena.walk(z,dx,dy,z.speed*dt):
                 z.angle = math.atan2(dy,dx)
+        self.zombies.extend(reinforcements)
 
     def check_upgrade(self):
         if self.xp >= self.xp_goal:
@@ -791,7 +909,7 @@ class Game(arcade.Window):
         elif choice == 2:
             self.reload_speed /= .8
         elif choice == 3:
-            self.player.hp = min(100, self.player.hp+35)
+            self.player.hp = min(self.player.max_hp, self.player.hp+35)
         elif choice == 4:
             self.player.reserve += 60
         elif choice == 5:
@@ -800,8 +918,15 @@ class Game(arcade.Window):
             self.armor *= .85
         elif choice == 7:
             self.regeneration += 1
-        else:
+        elif choice == 8:
             self.magazine_bonus += 4
+        elif choice == 9:
+            self.player.max_hp += 20
+            self.player.hp += 20
+        elif choice == 10:
+            self.dash_cooldown *= .8
+        else:
+            self.shot_range += .30
         self.state = "play"
         self.check_upgrade()
 
@@ -828,27 +953,34 @@ class Game(arcade.Window):
         self.update_shots(dt)
         self.update_zombies(dt)
         if self.state == "play":
+            self.update_acid(dt)
+        if self.state == "play":
             self.check_upgrade()
 
     def on_resize(self, width, height):
         self.view_width, self.view_height = view_size(width, height)
+
+    def apply_window_size(self):
+        size = fitted_window(self.preferences.window_size_index, self.screen.width, self.screen.height)
+        self.set_size(*size)
+        self.center_window()
+        self.on_resize(*self.get_size())
 
     def toggle_display(self):
         self.firing = False
         self.switching_display = True
         try:
             self.set_fullscreen(not self.fullscreen)
+            if not self.fullscreen:
+                self.apply_window_size()
             self.on_resize(*self.get_size())
         finally:
             self.switching_display = False
-        try:
-            self.screen_path.write_text("fullscreen" if self.fullscreen else "windowed")
-        except OSError:
-            pass
+        self.preferences.fullscreen = self.fullscreen
+        self.preferences.save(self.settings_path)
 
     def menu_buttons(self):
         x, y = self.view_width/2, self.view_height/2
-        display = "Полный экран" if self.fullscreen else "В окне"
         if self.state == "title":
             left = x-440
             return [
@@ -857,7 +989,7 @@ class Game(arcade.Window):
                   for i, rules in enumerate(DIFFICULTIES)),
                 MenuButton("classic", "Классическая карта", left, y-115, 231, 66, "1  /  Открытая арена", COLORS[1]),
                 MenuButton("generated", "Случайная карта", left+244, y-115, 231, 66, "2  /  Кварталы и укрытия", COLORS[0]),
-                MenuButton("display", display, left, y-184, 231, 43, "F11"),
+                MenuButton("settings", "Настройки", left, y-184, 231, 43),
                 MenuButton("quit", "Выйти", left+244, y-184, 231, 43),
             ]
         if self.state in ("pause", "over"):
@@ -865,8 +997,26 @@ class Game(arcade.Window):
             return [
                 MenuButton("resume" if pause else "restart", "Продолжить" if pause else "Сыграть снова",
                            x-206, y-15, 412, 58, "Esc" if pause else "Enter", COLORS[1]),
-                MenuButton("display", display, x-206, y-79, 412, 50, "F11"),
+                MenuButton("settings", "Настройки", x-206, y-79, 412, 50),
                 MenuButton("title", "Главное меню", x-206, y-137, 412, 46, "M"),
+            ]
+        if self.state == "settings":
+            size = self.preferences.window_size_index
+            return [
+                MenuButton("windowed", "В окне", x-20, y+106, 152, 42,
+                           accent=None if self.fullscreen else COLORS[0]),
+                MenuButton("fullscreen", "Полный экран", x+145, y+106, 152, 42,
+                           accent=COLORS[0] if self.fullscreen else None),
+                *(MenuButton(f"size:{i}", f"{width} × {height}", x-20+i*108, y+50, 101, 42,
+                             accent=COLORS[0] if size == i else None)
+                  for i,(width,height) in enumerate(WINDOW_SIZES)),
+                MenuButton("volume:-10", "−", x-20, y-7, 51, 42),
+                MenuButton("volume:10", "+", x+246, y-7, 51, 42),
+                MenuButton("minimap", "Показана" if self.preferences.minimap else "Скрыта", x-20, y-63,
+                           317, 42, accent=COLORS[0] if self.preferences.minimap else None),
+                MenuButton("effects", "Полные" if self.preferences.effects else "Сдержанные", x-20, y-119,
+                           317, 42, accent=COLORS[0] if self.preferences.effects else None),
+                MenuButton("back", "Назад", x-296, y-193, 593, 48, "Esc", COLORS[1]),
             ]
         if self.state == "upgrade":
             return [
@@ -880,10 +1030,34 @@ class Game(arcade.Window):
         name, _, value = action.partition(":")
         if name == "difficulty":
             self.difficulty = int(value)
+            self.preferences.difficulty = self.difficulty
+            self.preferences.save(self.settings_path)
         elif name == "upgrade":
             self.choose(int(value))
-        elif name == "display":
-            self.toggle_display()
+        elif name == "settings":
+            self.settings_return = self.state
+            self.state = "settings"
+        elif name == "back":
+            self.state = self.settings_return
+        elif name in ("windowed", "fullscreen"):
+            if self.fullscreen != (name == "fullscreen"):
+                self.toggle_display()
+        elif name == "size":
+            self.preferences.window_size_index = int(value)
+            if not self.fullscreen:
+                self.apply_window_size()
+            self.preferences.save(self.settings_path)
+        elif name == "volume":
+            self.preferences.volume = clamp(self.preferences.volume+int(value),0,100)
+            self.preferences.save(self.settings_path)
+            self.sound("pickup", .7)
+        elif name in ("minimap", "effects"):
+            enabled = not getattr(self.preferences,name)
+            setattr(self.preferences,name,enabled)
+            self.preferences.save(self.settings_path)
+            if name == "effects" and not enabled:
+                self.sparks.clear()
+                self.casings.clear()
         elif name == "resume":
             self.state = "play"
         elif name == "title":
@@ -904,6 +1078,10 @@ class Game(arcade.Window):
         if key == k.F11 or (key == k.ENTER and modifiers & k.MOD_ALT):
             self.toggle_display()
             return
+        if self.state == "settings":
+            if key == k.ESCAPE:
+                self.activate_menu("back")
+            return
         if self.state in ("title","over"):
             if key in NUMBERS[:2]:
                 self.reset(key == NUMBERS[1])
@@ -912,7 +1090,7 @@ class Game(arcade.Window):
                 self.reset(self.arena.generated)
                 self.keys.add(key)
             elif key == k.F2:
-                self.difficulty = (self.difficulty+1) % len(DIFFICULTIES)
+                self.activate_menu(f"difficulty:{(self.difficulty+1) % len(DIFFICULTIES)}")
             elif key == k.M and self.state == "over":
                 self.state = "title"
         elif self.state == "upgrade":
@@ -986,39 +1164,40 @@ class Game(arcade.Window):
 
     def draw_arena(self, ox, oy):
         arena = self.arena
-        box(0, 0, self.view_width, self.view_height, (20,28,28))
+        _, suffix, curb, stripe, stone_edge = arena.palette
+        box(0, 0, self.view_width, self.view_height, (76,110,95))
         tile = 192
         for x in range(int(ox)//tile*tile, int(ox+self.view_width)+1, tile):
             for y in range(int(oy)//tile*tile, int(oy+self.view_height)+1, tile):
-                self.texture("ground", x+tile/2-ox, y+tile/2-oy, tile, tile)
+                self.texture("ground"+suffix, x+tile/2-ox, y+tile/2-oy, tile, tile)
         for lane in arena.lanes_x:
             x = lane-ox
             if not -arena.road < x < self.view_width+arena.road:
                 continue
-            box(x-arena.road/2-4, -oy, arena.road+8, SIZE, (89,99,88))
+            box(x-arena.road/2-4, -oy, arena.road+8, SIZE, curb)
             for y in range(max(0,int(oy)//tile*tile), min(SIZE,int(oy+self.view_height)+1), tile):
                 height = min(tile,SIZE-y)
-                self.texture("asphalt", x, y+height/2-oy, arena.road, height)
+                self.texture("asphalt"+suffix, x, y+height/2-oy, arena.road, height)
             for y in range(max(0,int(oy)//84*84), min(SIZE-30,int(oy+self.view_height)+1), 84):
-                box(x-1,y-oy,2,30,(134,126,89))
+                box(x-1,y-oy,2,30,stripe)
         for lane in arena.lanes_y:
             y = lane-oy
             if not -arena.road < y < self.view_height+arena.road:
                 continue
-            box(-ox, y-arena.road/2-4, SIZE, arena.road+8, (89,99,88))
+            box(-ox, y-arena.road/2-4, SIZE, arena.road+8, curb)
             for x in range(max(0,int(ox)//tile*tile), min(SIZE,int(ox+self.view_width)+1), tile):
                 width = min(tile,SIZE-x)
-                self.texture("asphalt", x+width/2-ox, y, width, arena.road)
+                self.texture("asphalt"+suffix, x+width/2-ox, y, width, arena.road)
             for x in range(max(0,int(ox)//84*84), min(SIZE-30,int(ox+self.view_width)+1), 84):
-                box(x-ox,y-1,30,2,(134,126,89))
+                box(x-ox,y-1,30,2,stripe)
         for lane_x in arena.lanes_x:
             for lane_y in arena.lanes_y:
                 x, y = lane_x-ox, lane_y-oy
                 size = arena.plaza if arena.generated else arena.road
                 if -size < x < self.view_width+size and -size < y < self.view_height+size:
-                    self.texture("concrete", x, y, size, size)
-                    arcade.draw_lbwh_rectangle_outline(x-size/2+5,y-size/2+5,size-10,size-10,(100,112,99),1)
-        arcade.draw_lbwh_rectangle_outline(5-ox,5-oy,SIZE-10,SIZE-10,(193,139,75),8)
+                    self.texture("concrete"+suffix, x, y, size, size)
+                    arcade.draw_lbwh_rectangle_outline(x-size/2+5,y-size/2+5,size-10,size-10,stone_edge,1)
+        arcade.draw_lbwh_rectangle_outline(5-ox,5-oy,SIZE-10,SIZE-10,(255,207,98),8)
         for c in arena.cover:
             x, y = c.x-ox, c.y-oy
             if x < self.view_width and y < self.view_height and x+c.w > 0 and y+c.h > 0:
@@ -1056,9 +1235,10 @@ class Game(arcade.Window):
             if z.armor > 0:
                 arcade.draw_circle_outline(x,y,z.radius+2,(128,185,208),1)
             if z.windup:
-                arcade.draw_circle_outline(x,y,z.radius+7,(255,199,109),2)
-                if z.kind in ("charger","boss"):
-                    arcade.draw_line(x,y,x+math.cos(z.heading)*118,y+math.sin(z.heading)*118,(255,199,109),2)
+                alert = ACID_COLOR if z.kind == "spitter" else CALL_COLOR if z.kind == "caller" and not z.called else (255,209,109)
+                arcade.draw_circle_outline(x,y,z.radius+7,alert,2)
+                if z.kind in ("charger","boss","spitter"):
+                    arcade.draw_line(x,y,x+math.cos(z.heading)*118,y+math.sin(z.heading)*118,alert,2)
             if z.boss:
                 box(x-36,y+44,72,5,(74,49,45))
                 box(x-36,y+44,72*z.hp/z.max_hp,5,z.color)
@@ -1082,17 +1262,22 @@ class Game(arcade.Window):
                 arcade.draw_circle_filled(mx-ox,my-oy,5,(255,177,70,135))
                 arcade.draw_circle_filled(mx-ox,my-oy,2.5,(255,243,190))
             box(x-14,y+27,28,3,(69,74,68))
-            box(x-14,y+27,28*f.hp/100,3,f.color)
+            box(x-14,y+27,28*f.hp/f.max_hp,3,f.color)
+        for droplet in self.acid:
+            x, y = droplet.x-ox, droplet.y-oy
+            arcade.draw_circle_filled(x,y,9,(79,108,52,190))
+            arcade.draw_circle_filled(x,y,6,ACID_COLOR)
+            arcade.draw_circle_filled(x+1,y+2,2,(248,255,190))
         for spark in self.sparks:
             arcade.draw_circle_filled(spark.x-ox,spark.y-oy,1+spark.life*9,spark.color)
         for shot in self.shots:
             x, y = shot.x-ox, shot.y-oy
-            if shot.trail:
+            if self.preferences.effects and shot.trail:
                 start_x, start_y = shot.trail
                 arcade.draw_line(start_x-ox,start_y-oy,x,y,(255,189,79,135),1)
             self.texture("bullet", x, y, 12, 4.3, math.atan2(shot.vy,shot.vx))
 
-    def panel(self, x, y, w, h, color=(20,29,32,244), edge=(57,73,76)):
+    def panel(self, x, y, w, h, color=(25,38,58,246), edge=(98,136,170)):
         box(x, y, w, h, color)
         arcade.draw_lbwh_rectangle_outline(x+.5, y+.5, w-1, h-1, edge, 1)
 
@@ -1105,11 +1290,10 @@ class Game(arcade.Window):
         w,h = self.view_width,self.view_height
         center = w/2
         p = self.player
-        teal, gold, muted = COLORS[0], COLORS[1], (157,177,179)
-        self.panel(22,h-80,248,58)
+        teal, gold, muted = COLORS[0], COLORS[1], (179,203,226)
+        self.panel(22,h-80,267,58)
         self.label("brand","ЗОНА 04",39,h-45,19,teal,bold=True)
-        mode = "Случайная" if self.arena.generated else "Классическая"
-        self.label("mode",f"{mode}  /  {self.rules.name}",39,h-65,10,muted)
+        self.label("mode",f"{self.arena.palette[0]}  /  {self.rules.name}",39,h-65,10,muted)
 
         self.panel(center-145,h-98,290,76)
         threats = len(self.zombies)+self.spawn_left
@@ -1124,8 +1308,8 @@ class Game(arcade.Window):
         self.texture("player_idle",58,62,63,63)
         hp_color = (252,127,114) if p.hp < 33 else teal
         self.label("hp_title","ЗДОРОВЬЕ",93,74,10,muted)
-        self.label("hp",f"{math.ceil(p.hp):02} / 100",93,49,17,hp_color,bold=True)
-        self.meter(93,35,176,5,p.hp/100,hp_color)
+        self.label("hp",f"{math.ceil(p.hp):02} / {p.max_hp}",93,49,17,hp_color,bold=True)
+        self.meter(93,35,176,5,p.hp/p.max_hp,hp_color)
 
         self.panel(center-144,22,288,80)
         self.label("level",f"УРОВЕНЬ {self.level}     {self.xp} / {self.xp_goal} ОПЫТА",
@@ -1158,6 +1342,11 @@ class Game(arcade.Window):
             self.panel(center-244,109,488,35,(17,25,28,236))
             self.label("loot","     /     ".join(actions),center,120,12,gold,True,True)
 
+        if not self.preferences.minimap:
+            self.panel(w-173,h-58,151,36)
+            minutes, seconds = divmod(int(self.match_time),60)
+            self.label("score",f"{minutes:02}:{seconds:02}  ·  ESC ПАУЗА",w-157,h-44,9,muted)
+            return
         x,y,size = w-173,h-198,137
         scale = size/SIZE
         self.panel(x-7,y-7,size+14,size+46)
@@ -1178,8 +1367,8 @@ class Game(arcade.Window):
     def draw_button(self, item):
         hover = item.contains(self.pointer)
         accent = item.accent or (232,240,235)
-        fill = (48,63,64) if hover else (27,40,43)
-        edge = accent if hover or item.accent else (60,78,82)
+        fill = (61,88,119) if hover else (34,52,79)
+        edge = accent if hover or item.accent else (89,119,157)
         self.panel(item.x,item.y,item.w,item.h,fill,edge)
         if item.accent:
             box(item.x+1,item.y+1,3,item.h-2,accent)
@@ -1189,6 +1378,12 @@ class Game(arcade.Window):
             self.label(f"key:{item.action}", f"{index}",tx,item.y+item.h-31,12,accent,bold=True)
             self.label(f"button:{item.action}",item.title,tx,item.y+46,16,bold=True)
             self.label(f"hint:{item.action}",item.hint,tx,item.y+22,10,(178,197,198))
+        elif self.state == "settings" and item.action in ("windowed", "fullscreen", "volume:-10", "volume:10"):
+            self.label(f"button:{item.action}",item.title,item.x+item.w/2,item.y+item.h/2-6,
+                       11,accent,True,True)
+        elif item.action.startswith("size:"):
+            self.label(f"button:{item.action}",item.title,item.x+item.w/2,item.y+item.h/2-6,
+                       10,accent,True,True)
         elif item.h >= 60:
             self.label(f"button:{item.action}",item.title,tx,item.y+33,12,bold=True)
             self.label(f"hint:{item.action}",item.hint,tx,item.y+14,10,(173,191,191))
@@ -1199,7 +1394,7 @@ class Game(arcade.Window):
                            item.y+item.h/2-5,10,(173,191,191))
 
     def draw_title(self, x, y):
-        self.panel(x-476,y-250,952,502,(16,25,29,254),(75,93,91))
+        self.panel(x-476,y-250,952,502,(26,40,66,254),(98,136,170))
         box(x-476,y+248,952,4,COLORS[1])
         left = x-440
         self.label("title","ЗОНА 04",left,y+153,62,bold=True)
@@ -1208,13 +1403,13 @@ class Game(arcade.Window):
         self.label("difficulty_description",self.rules.description,left,y-19,12,(173,191,191))
         self.label("keys","WASD   Движение     ЛКМ   Огонь     R   Перезарядка",
                    left,y-224,11,(173,191,191))
-        self.panel(x+73,y-187,366,369,(24,39,39),(65,87,86))
-        box(x+74,y+166,364,15,(50,63,57))
+        self.panel(x+73,y-187,366,369,(45,78,102),(114,163,180))
+        box(x+74,y+166,364,15,(59,96,125))
         for i in range(14):
             arcade.draw_line(x+83+i*25,y+167,x+94+i*25,y+179,(180,152,91),2)
         for name,dx,dy,size,angle in (
             ("walker_1", 209,78,100,-1.1), ("armored_0",340,84,120,-2),
-            ("runner_1",354,-38,100,-2.9), ("charger_1",175,-58,95,.35),
+            ("spitter_1",354,-38,100,-2.9), ("caller_1",175,-58,95,.35),
         ):
             self.texture(name,x+dx,y+dy,size,size,angle)
         p = self.player
@@ -1223,17 +1418,34 @@ class Game(arcade.Window):
         self.label("record",f"РЕКОРД   {self.best} УСТРАНЕНО",
                    x+256,y-154,12,COLORS[1],True,True)
 
+    def draw_settings(self, x, y):
+        self.panel(x-328,y-222,656,462,(26,40,66,254))
+        box(x-328,y+237,656,3,COLORS[0])
+        self.label("settings_title","НАСТРОЙКИ",x-296,y+177,32,COLORS[1],bold=True)
+        for name, title, row_y in (
+            ("display","Режим экрана",126),
+            ("resolution","Размер окна",70),
+            ("volume","Громкость",13),
+            ("minimap","Мини-карта", -43),
+            ("effects","Частицы и трассеры", -99),
+        ):
+            self.label(f"setting:{name}",title,x-296,y+row_y-4,13,(203,218,237),bold=True)
+        self.label("volume_value",f"{self.preferences.volume}%",x+139,y+17,13,COLORS[0],True,True)
+        self.meter(x+53,y+4,174,4,self.preferences.volume/100,COLORS[0])
+
     def draw_overlay(self):
         x,y = self.view_width/2,self.view_height/2
-        box(0,0,self.view_width,self.view_height,(8,14,17,188))
+        box(0,0,self.view_width,self.view_height,(17,28,49,173))
         if self.state == "title":
             self.draw_title(x,y)
+        elif self.state == "settings":
+            self.draw_settings(x,y)
         elif self.state == "upgrade":
-            self.panel(x-484,y-99,968,250,(16,25,29,251))
+            self.panel(x-484,y-99,968,250,(26,40,66,251))
             self.label("upgrade_title",f"УРОВЕНЬ {self.level}",x,y+96,32,COLORS[1],True,True)
             self.label("upgrade_hint","Выбери одно улучшение",x,y+70,12,(170,185,185),True)
         else:
-            self.panel(x-236,y-166,472,342,(16,25,29,252))
+            self.panel(x-236,y-166,472,342,(26,40,66,252))
             pause = self.state == "pause"
             self.label("overlay","ПАУЗА" if pause else "ТЫ ПОГИБ",x,y+103,40,COLORS[1],True,True)
             detail = f"Волна {self.wave}   ·   Устранено {self.kills}"
@@ -1255,7 +1467,7 @@ class Game(arcade.Window):
             ox, oy = self.origin
             self.draw_arena(ox, oy)
             self.draw_units(ox, oy)
-            if self.state != "title":
+            if self.state != "title" and not (self.state == "settings" and self.settings_return == "title"):
                 self.draw_hud(ox, oy)
             if self.state == "play":
                 if self.player.hp < 33:
@@ -1285,6 +1497,11 @@ if __name__ == "__main__":
         art = load_art()
         if len(art) != len(ASSET_NAMES) or len(load_player_models(art)) != 20:
             raise RuntimeError("Game sprite list is incomplete")
+        for name in SOUNDS:
+            with wave.open(str(ASSET_DIR / f"{name}.wav"), "rb") as sound:
+                if sound.getnframes() <= 0:
+                    raise RuntimeError(f"Empty sound effect {name}")
+        arcade.load_sound(ASSET_DIR / "shot.wav")
     else:
         Game()
         arcade.run()

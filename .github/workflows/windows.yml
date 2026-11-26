@@ -24,7 +24,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Copy-Item -Path README.md,quarantine.py,requirements.txt,Create-Desktop-Shortcut.bat -Destination dist/Zone04
+          Copy-Item -Path README.md,quarantine.py,settings.py,requirements.txt,Create-Desktop-Shortcut.bat -Destination dist/Zone04
           Copy-Item -Path assets -Destination dist/Zone04 -Recurse
           python -c "import shutil; shutil.make_archive('Zone04-Windows', 'zip', 'dist', 'Zone04')"
           if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
