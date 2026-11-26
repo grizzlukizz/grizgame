@@ -1,5 +1,6 @@
 import math
 import random
+import sys
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
@@ -930,5 +931,12 @@ class Game(arcade.Window):
 
 
 if __name__ == "__main__":
-    Game()
-    arcade.run()
+    if sys.argv[1:] == ["--check-build"]:
+        shader = arcade.resources.resolve(
+            ":system:shaders/shape_element_list_fs.glsl"
+        )
+        if not shader.read_bytes():
+            raise RuntimeError("Arcade shader is empty")
+    else:
+        Game()
+        arcade.run()

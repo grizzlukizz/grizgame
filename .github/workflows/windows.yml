@@ -18,18 +18,26 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: python -m pip install -r requirements.txt pyinstaller==6.17.0
-      - name: Build standalone executable
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name Zone04 --collect-data arcade quarantine.py
+      - name: Build portable Windows game
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name Zone04 --collect-data arcade quarantine.py
       - name: Check executable and package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $binary = 'dist/Zone04.exe'
-          $bytes = [IO.File]::ReadAllBytes((Resolve-Path $binary))
-          if ($bytes[0] -ne 77 -or $bytes[1] -ne 90) { throw 'Expected a Windows executable' }
-          New-Item -ItemType Directory -Path package/Zone04 | Out-Null
-          Copy-Item -Path $binary,README.md,quarantine.py,requirements.txt -Destination package/Zone04
-          Compress-Archive -Path package/Zone04 -DestinationPath Zone04-Windows.zip
+          Copy-Item -Path README.md,quarantine.py,requirements.txt -Destination dist/Zone04
+          python -c "import shutil; shutil.make_archive('Zone04-Windows', 'zip', 'dist', 'Zone04')"
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
+          Expand-Archive -Path Zone04-Windows.zip -DestinationPath verification
+          $game = (Resolve-Path verification/Zone04).Path
+          $exe = Join-Path $game 'Zone04.exe'
+          $dll = Join-Path $game '_internal/python312.dll'
+          if (!(Test-Path $dll)) { throw 'Bundled Python DLL is missing' }
+          $probe = Start-Process -FilePath $exe -ArgumentList '--check-build' -WorkingDirectory $game -PassThru
+          if (!$probe.WaitForExit(30000)) {
+            Stop-Process -Id $probe.Id -Force
+            throw 'Packaged executable did not finish its startup check'
+          }
+          if ($probe.ExitCode -ne 0) { throw "Packaged executable failed its startup check: $($probe.ExitCode)" }
       - uses: actions/upload-artifact@v4
         with:
           name: Zone04-Windows
