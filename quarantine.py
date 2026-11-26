@@ -9,6 +9,7 @@ import arcade
 SIZE = 3200
 WIDTH, HEIGHT = 1200, 760
 COLORS = [(99,222,232), (246,189,103), (198,155,248), (146,214,154)]
+DIFFICULTIES = (("Разведка", .75, .72), ("Выживание", 1, 1), ("Кошмар", 1.3, 1.4))
 NUMBERS = (arcade.key.KEY_1, arcade.key.KEY_2, arcade.key.KEY_3, arcade.key.KEY_4)
 
 
@@ -46,6 +47,9 @@ UPGRADES = (
     ("Аптечка", "+35 здоровья каждому выжившему"),
     ("Запас патронов", "+60 патронов каждому выжившему"),
     ("Ускоренный спуск", "+20% базового темпа огня"),
+    ("Бронежилеты", "Отряд получает на 15% меньше урона"),
+    ("Полевой медик", "+1 здоровье в секунду вне контакта"),
+    ("Длинные магазины", "+4 патрона к ёмкости магазина"),
 )
 
 
@@ -63,6 +67,8 @@ class Fighter:
     reload: float = 0
     angle: float = 0
     radius: int = 13
+    dash_ready: float = 0
+    hurt: float = 0
 
 
 @dataclass
@@ -73,6 +79,9 @@ class Zombie:
     speed: float
     radius: int
     color: tuple
+    boss: bool = False
+    flash: float = 0
+    max_hp: float = 0
 
 
 @dataclass
@@ -92,6 +101,17 @@ class Loot:
     weapon: Weapon | None
     magazine: int
     reserve: int
+    heal: int = 0
+
+
+@dataclass
+class Spark:
+    x: float
+    y: float
+    vx: float
+    vy: float
+    color: tuple
+    life: float
 
 
 COVER_TYPES = {
@@ -227,10 +247,16 @@ class Arena:
         fraction = min(step/span,1)
         x = clamp(unit.x+dx*fraction,unit.radius,SIZE-unit.radius)
         y = clamp(unit.y+dy*fraction,unit.radius,SIZE-unit.radius)
-        if self.obstruction(unit.x,unit.y,x,unit.y,unit.radius)[1] is None:
-            unit.x = x
-        if self.obstruction(unit.x,unit.y,unit.x,y,unit.radius)[1] is None:
-            unit.y = y
+        hit_x, _ = self.obstruction(unit.x, unit.y, x, unit.y, unit.radius)
+        if hit_x < math.inf:
+            delta = x - unit.x
+            x = unit.x + math.copysign(max(0, abs(delta)*hit_x - .01), delta)
+        unit.x = x
+        hit_y, _ = self.obstruction(unit.x, unit.y, unit.x, y, unit.radius)
+        if hit_y < math.inf:
+            delta = y - unit.y
+            y = unit.y + math.copysign(max(0, abs(delta)*hit_y - .01), delta)
+        unit.y = y
 
 
 class Game(arcade.Window):
@@ -242,6 +268,7 @@ class Game(arcade.Window):
         except (OSError, ValueError):
             self.best = 0
         self.labels = {}
+        self.difficulty = 1
         self.reset()
         self.state = "title"
 
@@ -257,7 +284,7 @@ class Game(arcade.Window):
         self.keys = set()
         self.mouse = (WIDTH*.65, HEIGHT*.5)
         self.firing = False
-        self.zombies, self.shots, self.loot = [], [], []
+        self.zombies, self.shots, self.loot, self.sparks = [], [], [], []
         self.state = "play"
         self.match_time = 0
         self.wave = self.spawn_left = self.kills = self.xp = 0
@@ -268,6 +295,9 @@ class Game(arcade.Window):
         self.options = []
         self.notice = ""
         self.notice_until = 0
+        self.regeneration = 0
+        self.armor = 1
+        self.magazine_bonus = 0
 
     @property
     def player(self):
@@ -289,8 +319,30 @@ class Game(arcade.Window):
     def notify(self, message):
         self.notice, self.notice_until = message, self.match_time+2.5
 
+    def capacity(self, fighter):
+        return fighter.weapon.capacity + self.magazine_bonus
+
+    def burst(self, x, y, color, count):
+        for _ in range(count):
+            angle = random.uniform(0, math.tau)
+            speed = random.uniform(30, 150)
+            self.sparks.append(Spark(x, y, math.cos(angle)*speed, math.sin(angle)*speed, color, .22))
+
+    def dash(self):
+        fighter = self.player
+        if fighter.dash_ready > self.match_time:
+            return
+        dx, dy = self.movement()
+        if not (dx or dy):
+            dx, dy = math.cos(fighter.angle), math.sin(fighter.angle)
+        x, y = fighter.x, fighter.y
+        self.arena.move(fighter, dx*160, dy*160, 145)
+        if math.hypot(x-fighter.x, y-fighter.y) > 1:
+            fighter.dash_ready = self.match_time + 2.4
+            self.burst(x, y, fighter.color, 14)
+
     def reload_weapon(self, fighter):
-        if fighter.reload <= 0 and fighter.magazine < fighter.weapon.capacity and fighter.reserve:
+        if fighter.reload <= 0 and fighter.magazine < self.capacity(fighter) and fighter.reserve:
             fighter.reload = 1.15/self.reload_speed
 
     def fire(self, fighter):
@@ -300,6 +352,7 @@ class Game(arcade.Window):
             self.reload_weapon(fighter)
             return
         fighter.magazine -= 1
+        self.burst(fighter.x+math.cos(fighter.angle)*22, fighter.y+math.sin(fighter.angle)*22, COLORS[1], 3)
         fighter.cooldown = fighter.weapon.interval/self.fire_rate
         for spread in fighter.weapon.spread:
             angle = fighter.angle + spread
@@ -308,10 +361,13 @@ class Game(arcade.Window):
                                    fighter.weapon.damage*self.damage))
 
     def nearby(self, weapon):
+        p = self.player
         options = (item for item in self.loot
-                   if (item.weapon if weapon else item.magazine+item.reserve))
+                   if (item.weapon if weapon else item.magazine+item.reserve+item.heal)
+                   and distance(p,item) <= 65
+                   and self.arena.obstruction(p.x,p.y,item.x,item.y)[1] is None)
         item = min(options,key=lambda drop: distance(self.player,drop),default=None)
-        return item if item and distance(self.player,item) <= 65 else None
+        return item
 
     def collect(self, swap=False):
         item = self.nearby(swap)
@@ -331,7 +387,12 @@ class Game(arcade.Window):
             item.magazine = item.reserve = 0
             if item.weapon is None:
                 self.loot.remove(item)
-            self.notify(f"+{amount} патронов")
+            if item.heal:
+                for fighter in self.living:
+                    fighter.hp = min(100, fighter.hp+item.heal)
+                self.notify(f"Припасы: +{amount} патронов и лечение отряда")
+            else:
+                self.notify(f"+{amount} патронов")
 
     def kill_fighter(self, fighter):
         fighter.hp = 0
@@ -349,55 +410,83 @@ class Game(arcade.Window):
         elif fighter is self.player:
             self.active = self.fighters.index(self.living[0])
 
-    def spawn(self):
+    def spawn(self, boss=False):
         p = self.player
         for _ in range(48):
             angle, radius = random.uniform(0,math.tau), random.uniform(760,1010)
             x = clamp(p.x+math.cos(angle)*radius,28,SIZE-28)
             y = clamp(p.y+math.sin(angle)*radius,28,SIZE-28)
-            if math.hypot(x-p.x,y-p.y) > 710 and not self.arena.blocked(x,y,26):
+            ox, oy = self.origin
+            in_view = ox-42 < x < ox+WIDTH+42 and oy-42 < y < oy+HEIGHT+42
+            if not in_view and math.hypot(x-p.x,y-p.y) > 710 and not self.arena.blocked(x,y,42):
                 break
         else:
             x,y = (28 if p.x > SIZE/2 else SIZE-28),clamp(p.y,28,SIZE-28)
         roll = random.random()
-        hp = 36+4*self.wave
-        if self.wave >= 3 and roll < .15:
+        _, health, _ = DIFFICULTIES[self.difficulty]
+        hp = (36+4*self.wave)*health
+        if boss:
+            zombie = Zombie(x,y,hp*7,83,34,(229,126,82),boss=True)
+        elif self.wave >= 3 and roll < .15:
             zombie = Zombie(x,y,hp*2.8,58,23,(119,141,76))
         elif self.wave >= 2 and roll < .39:
             zombie = Zombie(x,y,hp*.75,142,13,(202,111,100))
         else:
             zombie = Zombie(x,y,hp,random.uniform(75,112),16,(143,172,104))
+        zombie.max_hp = zombie.hp
         self.zombies.append(zombie)
 
     def update_wave(self, dt):
         if self.spawn_left:
             self.spawn_timer -= dt
             if self.spawn_timer <= 0:
-                self.spawn()
+                self.spawn(boss=self.wave % 5 == 0 and self.spawn_left == 1)
                 self.spawn_left -= 1
                 self.spawn_timer = max(.19,.75-.045*self.wave)
         elif not self.zombies:
             self.break_time -= dt
             if self.break_time <= 0:
                 self.wave += 1
+                if self.wave > 1:
+                    self.drop_supplies()
                 self.spawn_left = min(70,8+self.wave*5)
                 self.spawn_timer = 0
                 self.break_time = 5
                 self.notify(f"Волна {self.wave}")
 
-    def update_fighters(self, dt):
-        p,k = self.player,arcade.key
+    def drop_supplies(self):
+        p = self.player
+        for angle in random.sample(range(0, 360, 30), 12):
+            radians = math.radians(angle)
+            x = clamp(p.x + 140*math.cos(radians),24,SIZE-24)
+            y = clamp(p.y + 140*math.sin(radians),24,SIZE-24)
+            if math.hypot(x-p.x,y-p.y) > 65 and self.arena.obstruction(p.x,p.y,x,y,13)[1] is None:
+                break
+        else:
+            x,y = p.x,p.y
+        self.loot.append(Loot(x,y,None,0,38,16))
+
+    def movement(self):
+        k = arcade.key
         dx = bool(self.keys & {k.D,k.RIGHT}) - bool(self.keys & {k.A,k.LEFT})
         dy = bool(self.keys & {k.W,k.UP}) - bool(self.keys & {k.S,k.DOWN})
+        return dx,dy
+
+    def update_fighters(self, dt):
+        p = self.player
+        dx,dy = self.movement()
         self.arena.move(p,dx*100,dy*100,250*self.speed*dt)
         ox,oy = self.origin
         p.angle = math.atan2(self.mouse[1]+oy-p.y,self.mouse[0]+ox-p.x)
         for f in self.living:
             f.cooldown = max(0,f.cooldown-dt)
+            f.hurt = max(0,f.hurt-dt)
+            if not f.hurt:
+                f.hp = min(100,f.hp+self.regeneration*dt)
             if f.reload > 0:
                 f.reload -= dt
                 if f.reload <= 0:
-                    amount = min(f.weapon.capacity-f.magazine,f.reserve)
+                    amount = min(self.capacity(f)-f.magazine,f.reserve)
                     f.magazine += amount
                     f.reserve -= amount
         if self.firing:
@@ -440,11 +529,15 @@ class Game(arcade.Window):
                     hit,hit_at = z,entry
             if hit:
                 hit.hp -= shot.damage
+                hit.flash = .09
+                self.burst(hit.x,hit.y,hit.color,4)
                 if hit.hp <= 0:
                     self.zombies.remove(hit)
                     self.kills += 1
-                    self.xp += 1
-                    if self.kills % 3 == 0:
+                    self.xp += 5 if hit.boss else 1
+                    if hit.boss:
+                        self.loot.append(Loot(hit.x,hit.y,None,0,80,35))
+                    elif self.kills % 3 == 0:
                         self.loot.append(Loot(hit.x,hit.y,None,0,16))
             elif wall_at == math.inf:
                 shot.x,shot.y = ex,ey
@@ -454,11 +547,14 @@ class Game(arcade.Window):
         self.shots = remaining
 
     def update_zombies(self, dt):
+        _, _, damage = DIFFICULTIES[self.difficulty]
         for z in self.zombies:
+            z.flash = max(0,z.flash-dt)
             target = min(self.living,key=lambda f: distance(z,f))
             gap = distance(z,target)
             if gap <= z.radius+11 and self.arena.obstruction(z.x,z.y,target.x,target.y)[1] is None:
-                target.hp -= 13*dt
+                target.hp -= (24 if z.boss else 13)*damage*self.armor*dt
+                target.hurt = 1.5
                 if target.hp <= 0:
                     self.kill_fighter(target)
                     if self.state == "over":
@@ -467,7 +563,7 @@ class Game(arcade.Window):
             x,y = self.arena.route(z,target.x,target.y)
             dx,dy = x-z.x,y-z.y
             for other in self.zombies:
-                if other is z:
+                if other is z or (x,y) != (target.x,target.y):
                     continue
                 separation = distance(z,other)
                 if 0 < separation < z.radius+other.radius:
@@ -497,8 +593,14 @@ class Game(arcade.Window):
         elif choice == 4:
             for f in self.living:
                 f.reserve += 60
-        else:
+        elif choice == 5:
             self.fire_rate += .2
+        elif choice == 6:
+            self.armor *= .85
+        elif choice == 7:
+            self.regeneration += 1
+        else:
+            self.magazine_bonus += 4
         self.state = "play"
         self.check_upgrade()
 
@@ -507,6 +609,11 @@ class Game(arcade.Window):
             return
         dt = min(delta_time,.05)
         self.match_time += dt
+        for spark in self.sparks:
+            spark.x += spark.vx*dt
+            spark.y += spark.vy*dt
+            spark.life -= dt
+        self.sparks = [spark for spark in self.sparks if spark.life > 0]
         self.update_wave(dt)
         self.update_fighters(dt)
         self.update_shots(dt)
@@ -516,20 +623,31 @@ class Game(arcade.Window):
 
     def on_key_press(self, key, modifiers):
         k = arcade.key
+        repeated = key in self.keys
         self.keys.add(key)
+        if repeated:
+            return
         if self.state in ("title","over"):
             if key in NUMBERS[:2]:
                 self.reset(key == NUMBERS[1])
+                self.keys.add(key)
             elif key == k.ENTER:
                 self.reset(self.arena.generated)
+                self.keys.add(key)
+            elif key == k.F2:
+                self.difficulty = (self.difficulty+1) % len(DIFFICULTIES)
         elif self.state == "upgrade":
             if key in NUMBERS[:3]:
                 self.choose(NUMBERS.index(key))
         elif key == k.ESCAPE:
             self.state = "pause" if self.state == "play" else "play"
             self.firing = False
+        elif self.state == "pause" and key == k.M:
+            self.state = "title"
         elif self.state == "play":
-            if key in NUMBERS and self.fighters[NUMBERS.index(key)].hp > 0:
+            if key == k.SPACE:
+                self.dash()
+            elif key in NUMBERS and self.fighters[NUMBERS.index(key)].hp > 0:
                 self.active = NUMBERS.index(key)
             elif key == k.TAB:
                 positions = [(self.active+i)%4 for i in range(1,5)]
@@ -616,13 +734,23 @@ class Game(arcade.Window):
             if item.weapon:
                 arcade.draw_circle_outline(x,y,15,COLORS[1],2)
                 box(x-7,y-2,14,4,COLORS[1])
+            elif item.heal:
+                box(x-10,y-10,20,20,(43,79,68))
+                box(x-6,y-2,12,4,COLORS[3])
+                box(x-2,y-6,4,12,COLORS[3])
             else:
                 box(x-4,y-4,8,8,COLORS[3])
         for z in self.zombies:
             x,y = z.x-ox,z.y-oy
             arcade.draw_circle_filled(x+3,y-4,z.radius+2,(17,23,19))
-            arcade.draw_circle_filled(x,y,z.radius,z.color)
+            arcade.draw_circle_filled(x,y,z.radius,(255,224,182) if z.flash else z.color)
             arcade.draw_circle_filled(x,y,z.radius*.54,(59,74,50))
+            if z.boss:
+                arcade.draw_circle_outline(x,y,z.radius+4,z.color,2)
+                box(x-36,y+44,72,5,(74,49,45))
+                box(x-36,y+44,72*z.hp/z.max_hp,5,z.color)
+        for spark in self.sparks:
+            arcade.draw_circle_filled(spark.x-ox,spark.y-oy,1+spark.life*9,spark.color)
         for shot in self.shots:
             x,y = shot.x-ox,shot.y-oy
             arcade.draw_line(x,y,x-shot.vx*.015,y-shot.vy*.015,(255,223,143),2)
@@ -641,7 +769,7 @@ class Game(arcade.Window):
         box(0,HEIGHT-71,WIDTH,71,(13,21,23))
         self.label("brand","ЗОНА 04",24,HEIGHT-30,20,COLORS[0],bold=True)
         mode = "СЛУЧАЙНАЯ КАРТА" if self.arena.generated else "КЛАССИЧЕСКАЯ КАРТА"
-        self.label("mode",mode,25,HEIGHT-52,10)
+        self.label("mode",f"{mode}  /  {DIFFICULTIES[self.difficulty][0]}",25,HEIGHT-52,10)
         threats = len(self.zombies)+self.spawn_left
         status = (f"ВОЛНА {self.wave:02}   /   УГРОЗЫ {threats}" if threats
                   else f"ДО ВОЛНЫ {self.wave+1:02}   /   {math.ceil(self.break_time)} с")
@@ -666,13 +794,15 @@ class Game(arcade.Window):
         ammo = "ПЕРЕЗАРЯДКА" if p.reload > 0 else f"{p.magazine:02}  /  {p.reserve:03}"
         self.label("ammo",ammo,730,37,21,p.color,bold=True)
         self.label("reload","R  ПЕРЕЗАРЯДИТЬ",731,18,10)
-        self.label("controls","WASD ХОДЬБА   ЛКМ ОГОНЬ   ESC ПАУЗА",914,29,10)
+        self.label("controls","WASD ХОДЬБА   ЛКМ ОГОНЬ   ESC ПАУЗА",914,42,10)
+        dash_left = max(0,p.dash_ready-self.match_time)
+        self.label("dash",f"ПРОБЕЛ  РЫВОК  {dash_left:.1f} с" if dash_left else "ПРОБЕЛ  РЫВОК ГОТОВ",914,21,10,p.color)
         if self.match_time < self.notice_until:
             self.label("notice",self.notice,WIDTH/2,HEIGHT-104,13,COLORS[1],True,True)
         ammo_drop,weapon_drop = self.nearby(False),self.nearby(True)
         actions = []
         if ammo_drop:
-            actions.append("E  подобрать патроны")
+            actions.append("E  подобрать припасы" if ammo_drop.heal else "E  подобрать патроны")
         if weapon_drop:
             actions.append(f"F  взять оружие «{weapon_drop.weapon.name}»")
         if actions and p.hp > 0:
@@ -695,11 +825,13 @@ class Game(arcade.Window):
             "title": ("ЗОНА 04", ("Четыре бойца против орды",
                       "1  Классическая карта     /     2  Случайная карта",
                       "WASD или стрелки — ходьба    /    ЛКМ — огонь    /    R — перезарядка",
-                      "1–4 или Tab — сменить бойца    /    E — патроны    /    F — оружие")),
-            "pause": ("ПАУЗА",("ESC  Продолжить",)),
+                      "1–4 или Tab — сменить бойца    /    E — припасы    /    F — оружие",
+                      f"Пробел — рывок    /    F2 — сложность: {DIFFICULTIES[self.difficulty][0]}")),
+            "pause": ("ПАУЗА",("ESC  Продолжить    /    M  В меню",)),
             "upgrade": (f"УРОВЕНЬ {self.level}",("Выбери одно улучшение для отряда",)),
             "over": ("ОТРЯД ПОГИБ",(f"Волна {self.wave}   /   Устранено {self.kills}   /   Рекорд {self.best}",
-                     "ENTER  Повторить режим     /     1  Классическая     /     2  Случайная")),
+                     "ENTER  Повторить режим     /     1  Классическая     /     2  Случайная",
+                     f"F2  Сложность: {DIFFICULTIES[self.difficulty][0]}")),
         }[self.state]
         self.label("overlay",title,WIDTH/2,467,55,COLORS[0],True,True)
         for i,line in enumerate(lines):
