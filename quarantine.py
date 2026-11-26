@@ -12,7 +12,7 @@ WIDTH, HEIGHT = 1200, 760
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
 COLORS = [(99,222,232), (246,189,103), (198,155,248), (146,214,154)]
 DIFFICULTIES = (("Разведка", .75, .72), ("Выживание", 1, 1), ("Кошмар", 1.3, 1.4))
-NUMBERS = (arcade.key.KEY_1, arcade.key.KEY_2, arcade.key.KEY_3, arcade.key.KEY_4)
+NUMBERS = (arcade.key.KEY_1, arcade.key.KEY_2, arcade.key.KEY_3)
 
 
 def clamp(value, low, high):
@@ -53,7 +53,7 @@ WEAPONS = (
     Weapon("Пистолет-пулемёт", 15, .115, 26, sprite="smg", muzzle=26),
     Weapon("Винтовка", 59, .53, 9, sprite="rifle", muzzle=38),
 )
-ARMORY = (
+CACHE_WEAPONS = WEAPONS[1:] + (
     Weapon("Пистолет", 24, .20, 15, reload_time=.78, sprite="pistol", muzzle=22),
     Weapon("Двустволка", 21, .46, 2, (-.24,-.16,-.08,0,.08,.16,.24), 760, .34, 1.03, "double", 36),
     Weapon("Штурмовая винтовка", 26, .14, 30, velocity=1030, reload_time=1.52, sprite="assault", muzzle=34),
@@ -61,14 +61,15 @@ ARMORY = (
     Weapon("Ручной пулемёт", 21, .10, 60, velocity=960, reload_time=2.45, sprite="lmg", muzzle=38),
     Weapon("Марксманская винтовка", 87, .73, 6, velocity=1320, flight_time=.77, reload_time=1.36, sprite="marksman", muzzle=40),
 )
+
 UPGRADES = (
     ("Усиленные патроны", "+25% базового урона"),
     ("Лёгкое снаряжение", "+12% базовой скорости"),
     ("Быстрые руки", "На 20% меньше времени на перезарядку"),
-    ("Аптечка", "+35 здоровья каждому выжившему"),
-    ("Запас патронов", "+60 патронов каждому выжившему"),
+    ("Аптечка", "+35 здоровья"),
+    ("Запас патронов", "+60 патронов"),
     ("Ускоренный спуск", "+20% базового темпа огня"),
-    ("Бронежилеты", "Отряд получает на 15% меньше урона"),
+    ("Бронежилет", "На 15% меньше получаемого урона"),
     ("Полевой медик", "+1 здоровье в секунду вне контакта"),
     ("Длинные магазины", "+4 патрона к ёмкости магазина"),
 )
@@ -90,7 +91,7 @@ class Fighter:
     radius: int = 13
     dash_ready: float = 0
     hurt: float = 0
-    stride: float = 0
+    move_angle: float = 0
     walking: bool = False
     muzzle_flash: float = 0
 
@@ -148,7 +149,6 @@ class Loot:
     magazine: int
     reserve: int
     heal: int = 0
-    fallen: int | None = None
 
 
 @dataclass
@@ -173,9 +173,9 @@ COVER_TYPES = {
 }
 ZOMBIE_ART = ("walker", "runner", "armored", "charger", "boss")
 ASSET_NAMES = (
-    *(f"fighter_{index}_{frame}" for index in range(4) for frame in range(3)),
+    "player_idle", "player_walk",
     *(f"{kind}_{frame}" for kind in ZOMBIE_ART for frame in range(3)),
-    *(weapon.sprite for weapon in WEAPONS + ARMORY),
+    *(weapon.sprite for weapon in WEAPONS[:1] + CACHE_WEAPONS),
     *(sprite for _, _, sprite in COVER_TYPES.values()),
     "supply", "ammo", "bullet", "casing", "ground", "asphalt", "concrete",
 )
@@ -346,13 +346,8 @@ class Game(arcade.Window):
 
     def reset(self, generated=False):
         self.arena = Arena(generated)
-        self.fighters = [
-            Fighter(1600+x,1600+y,name,color,weapon,weapon.capacity)
-            for (x,y),name,color,weapon in zip(
-                [(0,0),(-65,-42),(65,-42),(0,-108)],
-                ["Сокол","Гром","Искра","Ворон"], COLORS, WEAPONS)
-        ]
-        self.active = 0
+        weapon = WEAPONS[0]
+        self.player = Fighter(SIZE/2, SIZE/2, "Сокол", COLORS[0], weapon, weapon.capacity)
         self.keys = set()
         self.mouse = (WIDTH*.65, HEIGHT*.5)
         self.firing = False
@@ -370,15 +365,7 @@ class Game(arcade.Window):
         self.regeneration = 0
         self.armor = 1
         self.magazine_bonus = 0
-        self.armory = random.sample(ARMORY, len(ARMORY))
-
-    @property
-    def player(self):
-        return self.fighters[self.active]
-
-    @property
-    def living(self):
-        return [f for f in self.fighters if f.hp > 0]
+        self.armory = random.sample(CACHE_WEAPONS, len(CACHE_WEAPONS))
 
     @property
     def origin(self):
@@ -471,30 +458,21 @@ class Game(arcade.Window):
             if item.weapon is None:
                 self.loot.remove(item)
             if item.heal:
-                for fighter in self.living:
-                    fighter.hp = min(100, fighter.hp+item.heal)
-                self.notify(f"Припасы: +{amount} патронов и лечение отряда")
+                f.hp = min(100, f.hp+item.heal)
+                self.notify(f"Припасы дают {amount} патронов и {item.heal} здоровья")
             else:
                 self.notify(f"+{amount} патронов")
 
-    def kill_fighter(self, fighter):
-        fighter.hp = 0
-        self.loot.append(Loot(
-            fighter.x, fighter.y, fighter.weapon, fighter.magazine, fighter.reserve,
-            fallen=self.fighters.index(fighter),
-        ))
-        self.notify(f"{fighter.name} погиб. Снаряжение осталось на месте.")
-        if not self.living:
-            self.state = "over"
-            self.firing = False
-            if self.kills > self.best:
-                self.best = self.kills
-                try:
-                    self.best_path.write_text(str(self.best))
-                except OSError:
-                    pass
-        elif fighter is self.player:
-            self.active = self.fighters.index(self.living[0])
+    def end_match(self):
+        self.player.hp = 0
+        self.state = "over"
+        self.firing = False
+        if self.kills > self.best:
+            self.best = self.kills
+            try:
+                self.best_path.write_text(str(self.best))
+            except OSError:
+                pass
 
     def spawn(self, boss=False):
         p = self.player
@@ -531,7 +509,7 @@ class Game(arcade.Window):
             if self.spawn_timer <= 0:
                 self.spawn(boss=self.wave % 5 == 0 and self.spawn_left == 1)
                 self.spawn_left -= 1
-                self.spawn_timer = max(.19,.75-.045*self.wave)
+                self.spawn_timer = max(.23,.85-.045*self.wave)
         elif not self.zombies:
             self.break_time -= dt
             if self.break_time <= 0:
@@ -541,8 +519,8 @@ class Game(arcade.Window):
                 if self.wave % 2 == 0:
                     self.drop_supplies(weapon=self.armory.pop())
                     if not self.armory:
-                        self.armory = random.sample(ARMORY, len(ARMORY))
-                self.spawn_left = min(70,8+self.wave*5)
+                        self.armory = random.sample(CACHE_WEAPONS, len(CACHE_WEAPONS))
+                self.spawn_left = min(56,6+self.wave*4)
                 self.spawn_timer = 0
                 self.break_time = 5
                 self.notify(f"Волна {self.wave}")
@@ -570,38 +548,29 @@ class Game(arcade.Window):
         dy = bool(self.keys & {k.W,k.UP}) - bool(self.keys & {k.S,k.DOWN})
         return dx,dy
 
-    def update_fighters(self, dt):
+    def update_player(self, dt):
         p = self.player
-        dx,dy = self.movement()
-        self.arena.walk(p,dx*100,dy*100,250*self.speed*dt)
+        dx, dy = self.movement()
+        old_x, old_y = p.x, p.y
+        self.arena.move(p, dx*100, dy*100, 250*self.speed*dt)
+        dx, dy = p.x-old_x, p.y-old_y
+        p.walking = math.hypot(dx, dy) > .01
+        if p.walking:
+            p.move_angle = math.atan2(dy, dx)
         p.angle = self.aim_angle()
-        for f in self.living:
-            f.cooldown = max(0,f.cooldown-dt)
-            f.muzzle_flash = max(0,f.muzzle_flash-dt)
-            f.hurt = max(0,f.hurt-dt)
-            if not f.hurt:
-                f.hp = min(100,f.hp+self.regeneration*dt)
-            if f.reload > 0:
-                f.reload -= dt
-                if f.reload <= 0:
-                    amount = min(self.capacity(f)-f.magazine,f.reserve)
-                    f.magazine += amount
-                    f.reserve -= amount
+        p.cooldown = max(0, p.cooldown-dt)
+        p.muzzle_flash = max(0, p.muzzle_flash-dt)
+        p.hurt = max(0, p.hurt-dt)
+        if not p.hurt:
+            p.hp = min(100, p.hp+self.regeneration*dt)
+        if p.reload > 0:
+            p.reload -= dt
+            if p.reload <= 0:
+                amount = min(self.capacity(p)-p.magazine, p.reserve)
+                p.magazine += amount
+                p.reserve -= amount
         if self.firing:
             self.fire(p)
-        allies = [f for f in self.living if f is not p]
-        for f,(dx,dy) in zip(allies,[(-65,-42),(65,-42),(0,-108)]):
-            x,y = self.arena.route(f,clamp(p.x+dx,18,SIZE-18),clamp(p.y+dy,18,SIZE-18))
-            f.walking = False
-            if math.hypot(x-f.x,y-f.y) > 3 and self.arena.walk(f,x-f.x,y-f.y,268*self.speed*dt):
-                f.angle = math.atan2(y-f.y,x-f.x)
-            targets = sorted((z for z in self.zombies if distance(f,z)<360),
-                             key=lambda z: distance(f,z))
-            for z in targets:
-                if self.arena.obstruction(f.x,f.y,z.x,z.y)[1] is None:
-                    f.angle = math.atan2(z.y-f.y,z.x-f.x)
-                    self.fire(f)
-                    break
 
     def update_shots(self, dt):
         remaining = []
@@ -668,17 +637,17 @@ class Game(arcade.Window):
                 self.loot.append(Loot(hit.x,hit.y,None,0,16))
         return True
 
-    def hurt_fighter(self, fighter, amount):
-        fighter.hp -= amount * DIFFICULTIES[self.difficulty][2] * self.armor
-        fighter.hurt = 1.5
-        if fighter.hp <= 0:
-            self.kill_fighter(fighter)
+    def hurt_player(self, amount):
+        self.player.hp -= amount * DIFFICULTIES[self.difficulty][2] * self.armor
+        self.player.hurt = 1.5
+        if self.player.hp <= 0:
+            self.end_match()
 
     def update_zombies(self, dt):
+        target = self.player
         for z in self.zombies:
             z.walking = False
             z.flash = max(0,z.flash-dt)
-            target = min(self.living,key=lambda f: distance(z,f))
             gap = distance(z,target)
             clear = self.arena.obstruction(z.x,z.y,target.x,target.y)[1] is None
             reach = z.radius + 26
@@ -691,11 +660,10 @@ class Game(arcade.Window):
                     z.charge = 0
                 else:
                     self.arena.walk(z,dx*100,dy*100,step)
-                    victim = next((f for f in self.living if distance(z,f) <= reach
-                                   and self.arena.obstruction(z.x,z.y,f.x,f.y)[1] is None),None)
-                    if victim:
+                    if (distance(z,target) <= reach
+                            and self.arena.obstruction(z.x,z.y,target.x,target.y)[1] is None):
                         z.charge = 0
-                        self.hurt_fighter(victim, 34 if z.boss else 21)
+                        self.hurt_player(34 if z.boss else 21)
                         if self.state == "over":
                             return
                 continue
@@ -706,7 +674,7 @@ class Game(arcade.Window):
                     if z.kind in ("charger","boss"):
                         z.charge = .44
                     elif gap <= reach and clear:
-                        self.hurt_fighter(target, 15 if z.kind == "armored" else 10)
+                        self.hurt_player(15 if z.kind == "armored" else 10)
                         if self.state == "over":
                             return
                 continue
@@ -746,11 +714,9 @@ class Game(arcade.Window):
         elif choice == 2:
             self.reload_speed /= .8
         elif choice == 3:
-            for f in self.living:
-                f.hp = min(100,f.hp+35)
+            self.player.hp = min(100, self.player.hp+35)
         elif choice == 4:
-            for f in self.living:
-                f.reserve += 60
+            self.player.reserve += 60
         elif choice == 5:
             self.fire_rate += .2
         elif choice == 6:
@@ -781,7 +747,7 @@ class Game(arcade.Window):
             casing.life -= dt
         self.casings = [casing for casing in self.casings if casing.life > 0]
         self.update_wave(dt)
-        self.update_fighters(dt)
+        self.update_player(dt)
         self.update_shots(dt)
         self.update_zombies(dt)
         if self.state == "play":
@@ -821,11 +787,6 @@ class Game(arcade.Window):
         elif self.state == "play":
             if key == k.SPACE:
                 self.dash()
-            elif key in NUMBERS and self.fighters[NUMBERS.index(key)].hp > 0:
-                self.active = NUMBERS.index(key)
-            elif key == k.TAB:
-                positions = [(self.active+i)%4 for i in range(1,5)]
-                self.active = next(i for i in positions if self.fighters[i].hp > 0)
             elif key == k.R:
                 self.reload_weapon(self.player)
             elif key == k.E:
@@ -929,8 +890,6 @@ class Game(arcade.Window):
             x, y = item.x-ox, item.y-oy
             if not (-45 < x < WIDTH+45 and -45 < y < HEIGHT+45):
                 continue
-            if item.fallen is not None:
-                self.texture(f"fighter_{item.fallen}_0", x-7, y-5, 58, 58, -.9, 145)
             if item.weapon:
                 arcade.draw_circle_outline(x,y,18,COLORS[1],1)
                 self.texture(item.weapon.sprite, x, y, 32, 12, .2)
@@ -959,14 +918,12 @@ class Game(arcade.Window):
             if z.boss:
                 box(x-36,y+44,72,5,(74,49,45))
                 box(x-36,y+44,72*z.hp/z.max_hp,5,z.color)
-        for f in self.living:
+        f = self.player
+        if f.hp > 0:
             x, y = f.x-ox, f.y-oy
-            index = self.fighters.index(f)
-            frame = 1+int(f.stride/9)%2 if f.walking else 0
+            sprite, angle = ("player_walk", f.move_angle) if f.walking else ("player_idle", f.angle)
             arcade.draw_ellipse_filled(x+3,y-4,29,22,(11,19,18,180))
-            if f is self.player:
-                arcade.draw_circle_outline(x,y,21,f.color,2)
-            self.texture(f"fighter_{index}_{frame}", x, y, 48, 48, f.angle)
+            self.texture(sprite, x, y, 48, 48, angle)
             dx, dy = math.cos(f.angle), math.sin(f.angle)
             length = f.weapon.muzzle+7
             grip = f.weapon.muzzle-length*.43
@@ -1005,17 +962,16 @@ class Game(arcade.Window):
         box(0,HEIGHT-73,WIDTH,3,(57,73,67))
         box(0,HEIGHT-73,WIDTH*self.xp/self.xp_goal,3,COLORS[0])
         box(0,0,WIDTH,91,(13,21,23))
-        for i,f in enumerate(self.fighters):
-            x = 20+i*170
-            color = f.color if f.hp > 0 else (136,145,143)
-            box(x,13,160,63,(31,52,53) if f is self.player else (25,36,37))
-            box(x,13,3,63,color)
-            self.label(f"name{i}",f"{i+1}   {f.name}",x+12,52,13,color,bold=True)
-            self.label(f"gun{i}",f.weapon.name if f.hp>0 else "Погиб",x+12,32,10)
-            if f.hp > 0:
-                box(x+12,22,135,3,(67,84,81))
-                box(x+12,22,135*f.hp/100,3,color)
         p = self.player
+        color = p.color
+        box(20, 13, 250, 63, (25,36,37))
+        self.texture("player_idle", 55, 45, 61, 61)
+        self.label("name", p.name, 89, 53, 14, color, bold=True)
+        self.label("hp", f"ЗДОРОВЬЕ {math.ceil(p.hp):02} / 100", 89, 32, 10)
+        box(89, 23, 164, 3, (67,84,81))
+        box(89, 23, 164*p.hp/100, 3, color)
+        self.texture(p.weapon.sprite, 325, 44, 70, 27)
+        self.label("gun", p.weapon.name, 366, 38, 14)
         ammo = "ПЕРЕЗАРЯДКА" if p.reload > 0 else f"{p.magazine:02}  /  {p.reserve:03}"
         self.label("ammo",ammo,730,37,21,p.color,bold=True)
         self.label("reload","R  ПЕРЕЗАРЯДИТЬ",731,18,10)
@@ -1045,21 +1001,21 @@ class Game(arcade.Window):
             box(x+c.x*scale,y+c.y*scale,c.w*scale,c.h*scale,(105,111,91))
         for z in self.zombies:
             arcade.draw_circle_filled(x+z.x*scale,y+z.y*scale,1.6,(206,116,102))
-        for f in self.living:
-            arcade.draw_circle_filled(x+f.x*scale,y+f.y*scale,3 if f is p else 2,f.color)
+        if p.hp > 0:
+            arcade.draw_circle_filled(x+p.x*scale,y+p.y*scale,3,p.color)
 
     def draw_overlay(self):
         box(0,0,WIDTH,HEIGHT,(8,15,16,220))
         title,lines = {
-            "title": ("ЗОНА 04", ("Четыре бойца против орды",
+            "title": ("ЗОНА 04", ("Один против орды",
                       "1  Классическая карта     /     2  Случайная карта",
                       "WASD или стрелки — ходьба    /    ЛКМ — огонь    /    R — перезарядка",
-                      "1–4 или Tab — сменить бойца    /    E — припасы    /    F — оружие",
+                      "E — припасы    /    F — оружие",
                       f"Пробел — рывок    /    F2 — сложность: {DIFFICULTIES[self.difficulty][0]}",
                       "F11 или Alt+Enter — полный экран")),
             "pause": ("ПАУЗА",("ESC  Продолжить    /    M  В меню",)),
-            "upgrade": (f"УРОВЕНЬ {self.level}",("Выбери одно улучшение для отряда",)),
-            "over": ("ОТРЯД ПОГИБ",(f"Волна {self.wave}   /   Устранено {self.kills}   /   Рекорд {self.best}",
+            "upgrade": (f"УРОВЕНЬ {self.level}",("Выбери одно улучшение",)),
+            "over": ("ТЫ ПОГИБ",(f"Волна {self.wave}   /   Устранено {self.kills}   /   Рекорд {self.best}",
                      "ENTER  Повторить режим     /     1  Классическая     /     2  Случайная",
                      f"F2  Сложность: {DIFFICULTIES[self.difficulty][0]}")),
         }[self.state]
