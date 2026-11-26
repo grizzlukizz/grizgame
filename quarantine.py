@@ -15,6 +15,9 @@ SIZE = 3200
 WIDTH, HEIGHT = WINDOW_SIZES[1]
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
 COLORS = [(99,239,239), (255,213,92), (221,158,255)]
+DASH_DURATION = .22
+DASH_DISTANCE = 145
+DASH_FADE = .10
 ACID_COLOR = (175,255,92)
 CALL_COLOR = (244,147,252)
 SOUNDS = ("shot", "reload", "pickup", "hit", "wave", "spit", "call", "dash")
@@ -123,6 +126,21 @@ UPGRADES = (
     ("Быстрый рывок", "На 20% короче откат рывка"),
     ("Дальнобойные пули", "+30% к дальности выстрелов"),
 )
+
+
+@dataclass
+class DashMotion:
+    x: float
+    y: float
+    angle: float
+    distance: float
+    elapsed: float = 0
+
+    def position(self, time):
+        t = clamp(time/DASH_DURATION,0,1)
+        progress = t*t*(3-2*t)
+        step = self.distance*progress
+        return self.x+math.cos(self.angle)*step, self.y+math.sin(self.angle)*step
 
 
 @dataclass
@@ -470,6 +488,7 @@ class Game(arcade.Window):
         self.armor = 1
         self.magazine_bonus = 0
         self.dash_cooldown = 2.4
+        self.dash_motion = None
         self.shot_range = 1.0
         self.armory = random.sample(CACHE_WEAPONS, len(CACHE_WEAPONS))
 
@@ -522,19 +541,27 @@ class Game(arcade.Window):
         return math.atan2(self.pointer[1]+y-self.player.y, self.pointer[0]+x-self.player.x)
 
     def dash(self):
-        fighter = self.player
-        if fighter.dash_ready > self.match_time:
+        p = self.player
+        if p.dash_ready > self.match_time:
             return
-        dx, dy = self.movement()
-        if not (dx or dy):
-            angle = self.aim_angle()
-            dx, dy = math.cos(angle), math.sin(angle)
-        x, y = fighter.x, fighter.y
-        self.arena.move(fighter, dx*160, dy*160, 145)
-        if math.hypot(x-fighter.x, y-fighter.y) > 1:
-            fighter.dash_ready = self.match_time + self.dash_cooldown
-            self.sound("dash")
-            self.burst(x, y, fighter.color, 14)
+        dx,dy = self.movement()
+        angle = math.atan2(dy,dx) if dx or dy else self.aim_angle()
+        dx,dy = math.cos(angle),math.sin(angle)
+        distance = DASH_DISTANCE
+        for coordinate, direction in ((p.x,dx), (p.y,dy)):
+            if abs(direction) > 1e-8:
+                edge = SIZE-p.radius if direction > 0 else p.radius
+                distance = min(distance,(edge-coordinate)/direction)
+        hit, cover = self.arena.obstruction(p.x,p.y,p.x+dx*distance,p.y+dy*distance,p.radius)
+        if cover is not None:
+            distance = distance*hit-.04
+        if distance <= 1:
+            return
+        self.dash_motion = DashMotion(p.x,p.y,angle,distance)
+        p.dash_ready = self.match_time+self.dash_cooldown
+        p.muzzle_flash = 0
+        self.sound("dash")
+        self.burst(p.x,p.y,p.color,8)
 
     def reload_weapon(self, fighter):
         if fighter.reload <= 0 and fighter.magazine < self.capacity(fighter) and fighter.reserve:
@@ -696,13 +723,23 @@ class Game(arcade.Window):
 
     def update_player(self, dt):
         p = self.player
-        dx, dy = self.movement()
-        old_x, old_y = p.x, p.y
-        self.arena.move(p, dx*100, dy*100, 250*self.speed*dt)
-        dx, dy = p.x-old_x, p.y-old_y
-        p.walking = math.hypot(dx, dy) > .01
-        if p.walking:
-            p.move_angle = math.atan2(dy, dx)
+        motion = self.dash_motion
+        dashing = motion is not None and motion.elapsed < DASH_DURATION
+        if motion:
+            motion.elapsed += dt
+            if motion.elapsed >= DASH_DURATION+DASH_FADE:
+                self.dash_motion = None
+        if dashing:
+            p.x,p.y = motion.position(motion.elapsed)
+            p.walking = False
+        else:
+            dx,dy = self.movement()
+            old_x,old_y = p.x,p.y
+            self.arena.move(p,dx*100,dy*100,250*self.speed*dt)
+            dx,dy = p.x-old_x,p.y-old_y
+            p.walking = math.hypot(dx,dy) > .01
+            if p.walking:
+                p.move_angle = math.atan2(dy,dx)
         p.angle = self.aim_angle()
         p.cooldown = max(0, p.cooldown-dt)
         p.muzzle_flash = max(0, p.muzzle_flash-dt)
@@ -715,7 +752,7 @@ class Game(arcade.Window):
                 amount = min(self.capacity(p)-p.magazine, p.reserve)
                 p.magazine += amount
                 p.reserve -= amount
-        if self.firing:
+        if self.firing and not dashing:
             self.fire(p)
 
     def update_shots(self, dt):
@@ -1208,6 +1245,19 @@ class Game(arcade.Window):
                 else:
                     self.texture(item, x+c.w/2, y+c.h/2, c.h, c.w, math.pi/2)
 
+    def draw_dash_trail(self, ox, oy):
+        motion = self.dash_motion
+        if motion is None or not self.preferences.effects:
+            return
+        model = self.player_models[self.player.weapon.sprite,"player_walk"]
+        fade = 1-clamp((motion.elapsed-DASH_DURATION)/DASH_FADE,0,1)
+        for delay, opacity in ((.085,45),(.058,70),(.030,105)):
+            time = motion.elapsed-delay
+            if 0 <= time < DASH_DURATION:
+                x,y = motion.position(time)
+                arcade.draw_texture_rect(model,arcade.XYWH(x-ox,y-oy,111,58),
+                                         alpha=round(opacity*fade),angle=math.degrees(motion.angle))
+
     def draw_units(self, ox, oy):
         for item in self.loot:
             x, y = item.x-ox, item.y-oy
@@ -1244,14 +1294,22 @@ class Game(arcade.Window):
                 box(x-36,y+44,72*z.hp/z.max_hp,5,z.color)
         f = self.player
         if f.hp > 0:
-            x, y = f.x-ox, f.y-oy
-            pose = "player_walk" if f.walking else "player_idle"
+            self.draw_dash_trail(ox,oy)
+            x,y = f.x-ox,f.y-oy
+            motion = self.dash_motion
+            dashing = motion is not None and motion.elapsed < DASH_DURATION
+            pose = "player_walk" if f.walking or dashing else "player_idle"
             angle = f.move_angle if f.walking and not self.firing else f.angle
             if f.muzzle_flash:
                 angle = f.shot_angle
             arcade.draw_ellipse_filled(x+3,y-4,29,22,(11,19,18,180))
             model = self.player_models[f.weapon.sprite, pose]
-            arcade.draw_texture_rect(model, arcade.XYWH(x,y,96,72), angle=math.degrees(angle))
+            stretch = 0
+            if dashing:
+                angle = motion.angle
+                stretch = math.sin(math.pi*motion.elapsed/DASH_DURATION)
+            arcade.draw_texture_rect(model, arcade.XYWH(x,y,96+17*stretch,72-13*stretch),
+                                     angle=math.degrees(angle))
             dx, dy = math.cos(angle), math.sin(angle)
             if f.muzzle_flash:
                 mx, my = f.x+dx*f.weapon.muzzle, f.y+dy*f.weapon.muzzle
