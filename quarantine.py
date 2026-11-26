@@ -329,7 +329,7 @@ class Game(arcade.Window):
     @property
     def origin(self):
         return (clamp(self.player.x-WIDTH/2,0,SIZE-WIDTH),
-                clamp(self.player.y-HEIGHT/2,0,SIZE-HEIGHT))
+                clamp(self.player.y-HEIGHT/2,-91,SIZE-HEIGHT+73))
 
     @property
     def xp_goal(self):
@@ -347,13 +347,18 @@ class Game(arcade.Window):
             speed = random.uniform(30, 150)
             self.sparks.append(Spark(x, y, math.cos(angle)*speed, math.sin(angle)*speed, color, .22))
 
+    def aim_angle(self):
+        x, y = self.origin
+        return math.atan2(self.mouse[1]+y-self.player.y, self.mouse[0]+x-self.player.x)
+
     def dash(self):
         fighter = self.player
         if fighter.dash_ready > self.match_time:
             return
         dx, dy = self.movement()
         if not (dx or dy):
-            dx, dy = math.cos(fighter.angle), math.sin(fighter.angle)
+            angle = self.aim_angle()
+            dx, dy = math.cos(angle), math.sin(angle)
         x, y = fighter.x, fighter.y
         self.arena.move(fighter, dx*160, dy*160, 145)
         if math.hypot(x-fighter.x, y-fighter.y) > 1:
@@ -432,16 +437,17 @@ class Game(arcade.Window):
 
     def spawn(self, boss=False):
         p = self.player
+        edge = 42 if boss else 28
+        ox, oy = self.origin
         for _ in range(48):
             angle, radius = random.uniform(0,math.tau), random.uniform(760,1010)
-            x = clamp(p.x+math.cos(angle)*radius,28,SIZE-28)
-            y = clamp(p.y+math.sin(angle)*radius,28,SIZE-28)
-            ox, oy = self.origin
+            x = clamp(p.x+math.cos(angle)*radius,edge,SIZE-edge)
+            y = clamp(p.y+math.sin(angle)*radius,edge,SIZE-edge)
             in_view = ox-42 < x < ox+WIDTH+42 and oy-42 < y < oy+HEIGHT+42
             if not in_view and math.hypot(x-p.x,y-p.y) > 710 and not self.arena.blocked(x,y,42):
                 break
         else:
-            x,y = (28 if p.x > SIZE/2 else SIZE-28),clamp(p.y,28,SIZE-28)
+            x,y = (edge if p.x > SIZE/2 else SIZE-edge),clamp(p.y,edge,SIZE-edge)
         roll = random.random()
         _, health, _ = DIFFICULTIES[self.difficulty]
         hp = (36+4*self.wave)*health
@@ -507,8 +513,7 @@ class Game(arcade.Window):
         p = self.player
         dx,dy = self.movement()
         self.arena.move(p,dx*100,dy*100,250*self.speed*dt)
-        ox,oy = self.origin
-        p.angle = math.atan2(self.mouse[1]+oy-p.y,self.mouse[0]+ox-p.x)
+        p.angle = self.aim_angle()
         for f in self.living:
             f.cooldown = max(0,f.cooldown-dt)
             f.hurt = max(0,f.hurt-dt)
@@ -538,7 +543,10 @@ class Game(arcade.Window):
     def update_shots(self, dt):
         remaining = []
         for shot in self.shots:
-            dx,dy = shot.vx*dt,shot.vy*dt
+            if shot.life <= 0:
+                continue
+            travel_time = min(dt, shot.life)
+            dx,dy = shot.vx*travel_time,shot.vy*travel_time
             length_sq = dx*dx+dy*dy
             if not length_sq:
                 remaining.append(shot)
@@ -884,7 +892,10 @@ class Game(arcade.Window):
         x,y,scale = 1054,540,125/SIZE
         box(x-4,y-4,133,133,(12,20,20,228))
         arcade.draw_lbwh_rectangle_outline(x,y,125,125,(92,117,105),1)
-        arcade.draw_lbwh_rectangle_outline(x+ox*scale,y+oy*scale,WIDTH*scale,HEIGHT*scale,(71,110,103),1)
+        bottom, top = max(0, oy), min(SIZE, oy+HEIGHT)
+        arcade.draw_lbwh_rectangle_outline(
+            x+ox*scale, y+bottom*scale, WIDTH*scale, (top-bottom)*scale, (71,110,103), 1
+        )
         for c in self.arena.cover:
             box(x+c.x*scale,y+c.y*scale,c.w*scale,c.h*scale,(105,111,91))
         for z in self.zombies:
