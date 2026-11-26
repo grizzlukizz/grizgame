@@ -32,6 +32,9 @@ class Weapon:
     interval: float
     capacity: int
     spread: tuple = (0,)
+    velocity: int = 880
+    flight_time: float = .75
+    reload_time: float = 1.15
 
 
 WEAPONS = (
@@ -39,6 +42,14 @@ WEAPONS = (
     Weapon("Дробовик", 14, .65, 7, (-.19, -.095, 0, .095, .19)),
     Weapon("Пистолет-пулемёт", 15, .115, 26),
     Weapon("Винтовка", 59, .53, 9),
+)
+ARMORY = (
+    Weapon("Пистолет", 24, .20, 15, reload_time=.78),
+    Weapon("Двустволка", 21, .46, 2, (-.24,-.16,-.08,0,.08,.16,.24), 760, .34, 1.03),
+    Weapon("Штурмовая винтовка", 26, .14, 30, velocity=1030, reload_time=1.52),
+    Weapon("Автодробовик", 13, .31, 10, (-.22,-.13,-.05,.05,.13,.22), 800, .44, 1.62),
+    Weapon("Ручной пулемёт", 21, .10, 60, velocity=960, reload_time=2.45),
+    Weapon("Марксманская винтовка", 87, .73, 6, velocity=1320, flight_time=.77, reload_time=1.36),
 )
 UPGRADES = (
     ("Усиленные патроны", "+25% базового урона"),
@@ -82,6 +93,12 @@ class Zombie:
     boss: bool = False
     flash: float = 0
     max_hp: float = 0
+    kind: str = "walker"
+    armor: float = 0
+    windup: float = 0
+    attack_ready: float = 0
+    charge: float = 0
+    heading: float = 0
 
 
 @dataclass
@@ -298,6 +315,7 @@ class Game(arcade.Window):
         self.regeneration = 0
         self.armor = 1
         self.magazine_bonus = 0
+        self.armory = random.sample(ARMORY, len(ARMORY))
 
     @property
     def player(self):
@@ -343,7 +361,7 @@ class Game(arcade.Window):
 
     def reload_weapon(self, fighter):
         if fighter.reload <= 0 and fighter.magazine < self.capacity(fighter) and fighter.reserve:
-            fighter.reload = 1.15/self.reload_speed
+            fighter.reload = fighter.weapon.reload_time/self.reload_speed
 
     def fire(self, fighter):
         if fighter.cooldown > 0 or fighter.reload > 0:
@@ -354,11 +372,12 @@ class Game(arcade.Window):
         fighter.magazine -= 1
         self.burst(fighter.x+math.cos(fighter.angle)*22, fighter.y+math.sin(fighter.angle)*22, COLORS[1], 3)
         fighter.cooldown = fighter.weapon.interval/self.fire_rate
-        for spread in fighter.weapon.spread:
+        weapon = fighter.weapon
+        for spread in weapon.spread:
             angle = fighter.angle + spread
             dx,dy = math.cos(angle),math.sin(angle)
-            self.shots.append(Shot(fighter.x,fighter.y,880*dx,880*dy,
-                                   fighter.weapon.damage*self.damage))
+            self.shots.append(Shot(fighter.x,fighter.y,weapon.velocity*dx,weapon.velocity*dy,
+                                   weapon.damage*self.damage,weapon.flight_time))
 
     def nearby(self, weapon):
         p = self.player
@@ -426,11 +445,13 @@ class Game(arcade.Window):
         _, health, _ = DIFFICULTIES[self.difficulty]
         hp = (36+4*self.wave)*health
         if boss:
-            zombie = Zombie(x,y,hp*7,83,34,(229,126,82),boss=True)
-        elif self.wave >= 3 and roll < .15:
-            zombie = Zombie(x,y,hp*2.8,58,23,(119,141,76))
-        elif self.wave >= 2 and roll < .39:
-            zombie = Zombie(x,y,hp*.75,142,13,(202,111,100))
+            zombie = Zombie(x,y,hp*7,83,34,(229,126,82),boss=True,kind="boss")
+        elif self.wave >= 6 and roll < .13:
+            zombie = Zombie(x,y,hp*1.25,110,17,(219,140,93),kind="charger")
+        elif self.wave >= 3 and roll < .29:
+            zombie = Zombie(x,y,hp*1.65,70,22,(125,150,169),kind="armored",armor=hp*.8)
+        elif self.wave >= 2 and roll < .55:
+            zombie = Zombie(x,y,hp*.68,156,13,(202,111,100),kind="runner")
         else:
             zombie = Zombie(x,y,hp,random.uniform(75,112),16,(143,172,104))
         zombie.max_hp = zombie.hp
@@ -449,22 +470,31 @@ class Game(arcade.Window):
                 self.wave += 1
                 if self.wave > 1:
                     self.drop_supplies()
+                if self.wave % 2 == 0:
+                    self.drop_supplies(weapon=self.armory.pop())
+                    if not self.armory:
+                        self.armory = random.sample(ARMORY, len(ARMORY))
                 self.spawn_left = min(70,8+self.wave*5)
                 self.spawn_timer = 0
                 self.break_time = 5
                 self.notify(f"Волна {self.wave}")
 
-    def drop_supplies(self):
+    def drop_supplies(self, weapon=None):
         p = self.player
         for angle in random.sample(range(0, 360, 30), 12):
             radians = math.radians(angle)
             x = clamp(p.x + 140*math.cos(radians),24,SIZE-24)
             y = clamp(p.y + 140*math.sin(radians),24,SIZE-24)
-            if math.hypot(x-p.x,y-p.y) > 65 and self.arena.obstruction(p.x,p.y,x,y,13)[1] is None:
+            if (math.hypot(x-p.x,y-p.y) > 65
+                    and all(math.hypot(x-item.x,y-item.y) > 42 for item in self.loot)
+                    and self.arena.obstruction(p.x,p.y,x,y,13)[1] is None):
                 break
         else:
             x,y = p.x,p.y
-        self.loot.append(Loot(x,y,None,0,38,16))
+        if weapon:
+            self.loot.append(Loot(x,y,weapon,weapon.capacity,24))
+        else:
+            self.loot.append(Loot(x,y,None,0,38,16))
 
     def movement(self):
         k = arcade.key
@@ -528,7 +558,9 @@ class Game(arcade.Window):
                 if exit_at >= 0 and entry <= 1 and entry < hit_at:
                     hit,hit_at = z,entry
             if hit:
-                hit.hp -= shot.damage
+                absorbed = min(hit.armor, shot.damage*.65)
+                hit.armor -= absorbed
+                hit.hp -= shot.damage-absorbed
                 hit.flash = .09
                 self.burst(hit.x,hit.y,hit.color,4)
                 if hit.hp <= 0:
@@ -546,19 +578,53 @@ class Game(arcade.Window):
                     remaining.append(shot)
         self.shots = remaining
 
+    def hurt_fighter(self, fighter, amount):
+        fighter.hp -= amount * DIFFICULTIES[self.difficulty][2] * self.armor
+        fighter.hurt = 1.5
+        if fighter.hp <= 0:
+            self.kill_fighter(fighter)
+
     def update_zombies(self, dt):
-        _, _, damage = DIFFICULTIES[self.difficulty]
         for z in self.zombies:
             z.flash = max(0,z.flash-dt)
             target = min(self.living,key=lambda f: distance(z,f))
             gap = distance(z,target)
-            if gap <= z.radius+11 and self.arena.obstruction(z.x,z.y,target.x,target.y)[1] is None:
-                target.hp -= (24 if z.boss else 13)*damage*self.armor*dt
-                target.hurt = 1.5
-                if target.hp <= 0:
-                    self.kill_fighter(target)
-                    if self.state == "over":
-                        return
+            clear = self.arena.obstruction(z.x,z.y,target.x,target.y)[1] is None
+            reach = z.radius + 26
+            if z.charge > 0:
+                z.charge = max(0,z.charge-dt)
+                dx,dy = math.cos(z.heading),math.sin(z.heading)
+                step = 390*dt
+                wall = self.arena.obstruction(z.x,z.y,z.x+dx*step,z.y+dy*step,z.radius)[1]
+                if wall is not None:
+                    z.charge = 0
+                else:
+                    self.arena.move(z,dx*100,dy*100,step)
+                    victim = next((f for f in self.living if distance(z,f) <= reach
+                                   and self.arena.obstruction(z.x,z.y,f.x,f.y)[1] is None),None)
+                    if victim:
+                        z.charge = 0
+                        self.hurt_fighter(victim, 34 if z.boss else 21)
+                        if self.state == "over":
+                            return
+                continue
+            if z.windup > 0:
+                z.windup = max(0,z.windup-dt)
+                if not z.windup:
+                    z.attack_ready = self.match_time + (2.5 if z.kind in ("charger","boss") else .7)
+                    if z.kind in ("charger","boss"):
+                        z.charge = .44
+                    elif gap <= reach and clear:
+                        self.hurt_fighter(target, 15 if z.kind == "armored" else 10)
+                        if self.state == "over":
+                            return
+                continue
+            attack_range = 145 if z.kind in ("charger","boss") else reach
+            if gap <= attack_range and clear and self.match_time >= z.attack_ready:
+                z.windup = .55 if z.kind in ("charger","boss") else .22
+                z.heading = math.atan2(target.y-z.y,target.x-z.x)
+                continue
+            if gap <= reach-8 and clear:
                 continue
             x,y = self.arena.route(z,target.x,target.y)
             dx,dy = x-z.x,y-z.y
@@ -745,6 +811,12 @@ class Game(arcade.Window):
             arcade.draw_circle_filled(x+3,y-4,z.radius+2,(17,23,19))
             arcade.draw_circle_filled(x,y,z.radius,(255,224,182) if z.flash else z.color)
             arcade.draw_circle_filled(x,y,z.radius*.54,(59,74,50))
+            if z.armor > 0:
+                arcade.draw_circle_outline(x,y,z.radius-3,(192,220,239),3)
+            if z.windup:
+                arcade.draw_circle_outline(x,y,z.radius+7,(255,199,109),2)
+                if z.kind in ("charger","boss"):
+                    arcade.draw_line(x,y,x+math.cos(z.heading)*118,y+math.sin(z.heading)*118,(255,199,109),2)
             if z.boss:
                 arcade.draw_circle_outline(x,y,z.radius+4,z.color,2)
                 box(x-36,y+44,72,5,(74,49,45))

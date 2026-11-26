@@ -1,0 +1,42 @@
+name: Windows game
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller==6.17.0
+      - name: Build standalone executable
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name Zone04 --collect-data arcade quarantine.py
+      - name: Check executable and package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = 'dist/Zone04.exe'
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path $binary))
+          if ($bytes[0] -ne 77 -or $bytes[1] -ne 90) { throw 'Expected a Windows executable' }
+          New-Item -ItemType Directory -Path package/Zone04 | Out-Null
+          Copy-Item -Path $binary,README.md,quarantine.py,requirements.txt -Destination package/Zone04
+          Compress-Archive -Path package/Zone04 -DestinationPath Zone04-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zone04-Windows
+          path: Zone04-Windows.zip
+      - name: Publish release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" Zone04-Windows.zip --verify-tag --title "Зона 04" --generate-notes
