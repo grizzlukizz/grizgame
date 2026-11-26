@@ -19,12 +19,13 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt pyinstaller==6.17.0
       - name: Build portable Windows game
-        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name Zone04 --additional-hooks-dir packaging quarantine.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name Zone04 --additional-hooks-dir packaging --add-data "assets:assets" quarantine.py
       - name: Check executable and package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Copy-Item -Path README.md,quarantine.py,requirements.txt,Create-Desktop-Shortcut.bat -Destination dist/Zone04
+          Copy-Item -Path assets -Destination dist/Zone04 -Recurse
           python -c "import shutil; shutil.make_archive('Zone04-Windows', 'zip', 'dist', 'Zone04')"
           if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
           Expand-Archive -Path Zone04-Windows.zip -DestinationPath verification
