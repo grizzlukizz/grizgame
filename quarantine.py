@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import arcade
+from PIL import Image
 
 SIZE = 3200
 WIDTH, HEIGHT = 1200, 760
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
 COLORS = [(99,222,232), (246,189,103), (198,155,248), (146,214,154)]
-DIFFICULTIES = (("Разведка", .75, .72), ("Выживание", 1, 1), ("Кошмар", 1.3, 1.4))
 NUMBERS = (arcade.key.KEY_1, arcade.key.KEY_2, arcade.key.KEY_3)
 
 
@@ -23,14 +23,33 @@ def distance(a, b):
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
-def fit_viewport(width, height):
-    scale = min(width / WIDTH, height / HEIGHT)
-    w, h = max(1, round(WIDTH * scale)), max(1, round(HEIGHT * scale))
-    return (width-w)//2, (height-h)//2, w, h
+def view_size(width, height):
+    scale = min(max(1, width)/1080, max(1, height)/HEIGHT)
+    return max(1, width)/scale, max(1, height)/scale
 
 
 def box(x, y, w, h, color):
     arcade.draw_lbwh_rectangle_filled(x, y, w, h, color)
+
+
+@dataclass(frozen=True)
+class Difficulty:
+    name: str
+    description: str
+    count: float
+    health: float
+    damage: float
+    speed: float
+    interval: float
+    rest: float
+    supplies: int
+
+
+DIFFICULTIES = (
+    Difficulty("Разведка", "Меньше зомби, длиннее передышка", .84, .90, .86, 1.0, 1.15, 6, 54),
+    Difficulty("Выживание", "Плотные волны и ранняя броня", 1.31, 1.46, 1.38, 1.13, .70, 3.5, 42),
+    Difficulty("Кошмар", "Быстрые враги и мало припасов", 1.65, 1.86, 1.75, 1.25, .54, 2.5, 32),
+)
 
 
 @dataclass(frozen=True)
@@ -65,7 +84,7 @@ CACHE_WEAPONS = WEAPONS[1:] + (
 UPGRADES = (
     ("Усиленные патроны", "+25% базового урона"),
     ("Лёгкое снаряжение", "+12% базовой скорости"),
-    ("Быстрые руки", "На 20% меньше времени на перезарядку"),
+    ("Быстрые руки", "Перезарядка на 20% быстрее"),
     ("Аптечка", "+35 здоровья"),
     ("Запас патронов", "+60 патронов"),
     ("Ускоренный спуск", "+20% базового темпа огня"),
@@ -94,6 +113,7 @@ class Fighter:
     move_angle: float = 0
     walking: bool = False
     muzzle_flash: float = 0
+    shot_angle: float = 0
 
 
 @dataclass
@@ -183,6 +203,23 @@ ASSET_NAMES = (
 
 def load_art():
     return {name: arcade.load_texture(ASSET_DIR / f"{name}.png") for name in ASSET_NAMES}
+
+
+
+def load_player_models(art):
+    models = {}
+    for weapon in WEAPONS[:1] + CACHE_WEAPONS:
+        length = weapon.muzzle + 7
+        grip = weapon.muzzle - length*.43
+        width, height = round(length*4/3), round(length/2)
+        gun = art[weapon.sprite].image.resize((width, height), Image.Resampling.LANCZOS)
+        for pose in ("player_idle", "player_walk"):
+            image = Image.new("RGBA", (128,96))
+            image.alpha_composite(art[pose].image, (32,16))
+            image.alpha_composite(gun, (round(64+grip*4/3-width/2), 48-height//2))
+            models[weapon.sprite, pose] = arcade.Texture(image)
+    return models
+
 
 DISTRICTS = (
     (.88, ("Склад", "Контейнер", "Ящики", "Баррикада")),
@@ -325,15 +362,38 @@ class Arena:
         return unit.walking
 
 
+@dataclass(frozen=True)
+class MenuButton:
+    action: str
+    title: str
+    x: float
+    y: float
+    w: float
+    h: float
+    hint: str = ""
+    accent: tuple | None = None
+
+    def contains(self, point):
+        px, py = point
+        return self.x <= px <= self.x+self.w and self.y <= py <= self.y+self.h
+
+
 class Game(arcade.Window):
     def __init__(self):
         self.switching_display = False
-        super().__init__(WIDTH, HEIGHT, "Зона 04 / Карантин", resizable=True)
+        self.screen_path = Path.home() / ".arcade-zone04-display"
+        try:
+            full = self.screen_path.read_text().strip() == "fullscreen"
+        except (OSError, UnicodeError):
+            full = False
+        super().__init__(WIDTH, HEIGHT, "Зона 04 / Карантин", resizable=True, fullscreen=full)
         self.set_minimum_size(640, 405)
-        self.canvas = arcade.Camera2D(
-            position=(0, 0), projection=arcade.LRBT(0, WIDTH, 0, HEIGHT), window=self
+        self.view_width, self.view_height = view_size(*self.get_size())
+        self.game_camera = arcade.Camera2D(
+            position=(0, 0), projection=arcade.LRBT(0, self.view_width, 0, self.view_height), window=self
         )
         self.art = load_art()
+        self.player_models = load_player_models(self.art)
         self.best_path = Path.home() / ".arcade-zone04-best"
         try:
             self.best = int(self.best_path.read_text())
@@ -341,6 +401,8 @@ class Game(arcade.Window):
             self.best = 0
         self.labels = {}
         self.difficulty = 1
+        self.pointer_ratio = (.65, .5)
+        self.cursor_hidden = False
         self.reset()
         self.state = "title"
 
@@ -349,7 +411,7 @@ class Game(arcade.Window):
         weapon = WEAPONS[0]
         self.player = Fighter(SIZE/2, SIZE/2, "Сокол", COLORS[0], weapon, weapon.capacity)
         self.keys = set()
-        self.mouse = (WIDTH*.65, HEIGHT*.5)
+
         self.firing = False
         self.zombies, self.shots, self.loot, self.sparks, self.casings = [], [], [], [], []
         self.state = "play"
@@ -357,7 +419,7 @@ class Game(arcade.Window):
         self.wave = self.spawn_left = self.kills = self.xp = 0
         self.level = 1
         self.spawn_timer = 0
-        self.break_time = 4
+        self.break_time = self.rules.rest
         self.damage = self.speed = self.reload_speed = self.fire_rate = 1
         self.options = []
         self.notice = ""
@@ -368,9 +430,19 @@ class Game(arcade.Window):
         self.armory = random.sample(CACHE_WEAPONS, len(CACHE_WEAPONS))
 
     @property
+    def rules(self):
+        return DIFFICULTIES[self.difficulty]
+
+    @property
+    def pointer(self):
+        return self.pointer_ratio[0]*self.view_width, self.pointer_ratio[1]*self.view_height
+
+    @property
     def origin(self):
-        return (clamp(self.player.x-WIDTH/2,0,SIZE-WIDTH),
-                clamp(self.player.y-HEIGHT/2,-91,SIZE-HEIGHT+73))
+        return (
+            clamp(self.player.x-self.view_width/2, 0, max(0,SIZE-self.view_width)),
+            clamp(self.player.y-self.view_height/2, -92, max(-92,SIZE-self.view_height+92)),
+        )
 
     @property
     def xp_goal(self):
@@ -390,7 +462,7 @@ class Game(arcade.Window):
 
     def aim_angle(self):
         x, y = self.origin
-        return math.atan2(self.mouse[1]+y-self.player.y, self.mouse[0]+x-self.player.x)
+        return math.atan2(self.pointer[1]+y-self.player.y, self.pointer[0]+x-self.player.x)
 
     def dash(self):
         fighter = self.player
@@ -420,6 +492,7 @@ class Game(arcade.Window):
         weapon = fighter.weapon
         fighter.cooldown = weapon.interval / self.fire_rate
         fighter.muzzle_flash = .065
+        fighter.shot_angle = fighter.angle
         dx, dy = math.cos(fighter.angle), math.sin(fighter.angle)
         muzzle_x, muzzle_y = weapon.muzzle*dx, weapon.muzzle*dy
         self.casings.append(Casing(fighter.x+14*dx, fighter.y+14*dy, 82*dy, -82*dx, fighter.angle))
@@ -478,28 +551,32 @@ class Game(arcade.Window):
         p = self.player
         edge = 42 if boss else 28
         ox, oy = self.origin
-        for _ in range(48):
-            angle, radius = random.uniform(0,math.tau), random.uniform(760,1010)
+        w, h = self.view_width, self.view_height
+        # Spawn on all sides of the camera, including on wider monitors.
+        for _ in range(42):
+            angle = random.uniform(0, math.tau)
+            radius = random.uniform(635, max(920, math.hypot(w,h)/2+175))
             x = clamp(p.x+math.cos(angle)*radius,edge,SIZE-edge)
             y = clamp(p.y+math.sin(angle)*radius,edge,SIZE-edge)
-            in_view = ox-42 < x < ox+WIDTH+42 and oy-42 < y < oy+HEIGHT+42
-            if not in_view and math.hypot(x-p.x,y-p.y) > 710 and not self.arena.blocked(x,y,42):
+            in_view = ox-42 < x < ox+w+42 and oy-42 < y < oy+h+42
+            if not in_view and math.hypot(x-p.x,y-p.y) > 580 and not self.arena.blocked(x,y,42):
                 break
         else:
-            x,y = (edge if p.x > SIZE/2 else SIZE-edge),clamp(p.y,edge,SIZE-edge)
+            corners = [(x,y) for x in (edge,SIZE-edge) for y in (edge,SIZE-edge)]
+            x,y = max(corners, key=lambda q: math.hypot(q[0]-p.x,q[1]-p.y))
         roll = random.random()
-        _, health, _ = DIFFICULTIES[self.difficulty]
-        hp = (36+4*self.wave)*health
+        hp = (36+4*self.wave)*self.rules.health
         if boss:
             zombie = Zombie(x,y,hp*7,83,34,(229,126,82),boss=True,kind="boss")
-        elif self.wave >= 6 and roll < .13:
+        elif self.wave >= (6 if self.difficulty == 0 else 4) and roll < .21:
             zombie = Zombie(x,y,hp*1.25,110,17,(219,140,93),kind="charger")
-        elif self.wave >= 3 and roll < .29:
+        elif self.wave >= (3 if self.difficulty == 0 else 2) and roll < .42:
             zombie = Zombie(x,y,hp*1.65,70,22,(125,150,169),kind="armored",armor=hp*.8)
-        elif self.wave >= 2 and roll < .55:
+        elif self.wave >= (1 if self.difficulty == 2 else 2) and roll < .67:
             zombie = Zombie(x,y,hp*.68,156,13,(202,111,100),kind="runner")
         else:
             zombie = Zombie(x,y,hp,random.uniform(75,112),16,(143,172,104))
+        zombie.speed *= self.rules.speed
         zombie.max_hp = zombie.hp
         self.zombies.append(zombie)
 
@@ -509,7 +586,7 @@ class Game(arcade.Window):
             if self.spawn_timer <= 0:
                 self.spawn(boss=self.wave % 5 == 0 and self.spawn_left == 1)
                 self.spawn_left -= 1
-                self.spawn_timer = max(.23,.85-.045*self.wave)
+                self.spawn_timer = max(.23,.85-.045*self.wave)*self.rules.interval
         elif not self.zombies:
             self.break_time -= dt
             if self.break_time <= 0:
@@ -520,10 +597,11 @@ class Game(arcade.Window):
                     self.drop_supplies(weapon=self.armory.pop())
                     if not self.armory:
                         self.armory = random.sample(CACHE_WEAPONS, len(CACHE_WEAPONS))
-                self.spawn_left = min(56,6+self.wave*4)
+                self.spawn_left = min(96, round((8+self.wave*5)*self.rules.count))
                 self.spawn_timer = 0
-                self.break_time = 5
-                self.notify(f"Волна {self.wave}")
+                self.break_time = self.rules.rest
+                if self.wave % 5 == 0:
+                    self.notify("В этой волне появится громила-босс")
 
     def drop_supplies(self, weapon=None):
         p = self.player
@@ -540,7 +618,7 @@ class Game(arcade.Window):
         if weapon:
             self.loot.append(Loot(x,y,weapon,weapon.capacity,24))
         else:
-            self.loot.append(Loot(x,y,None,0,38,16))
+            self.loot.append(Loot(x,y,None,0,self.rules.supplies,16 if self.difficulty != 2 else 10))
 
     def movement(self):
         k = arcade.key
@@ -638,7 +716,7 @@ class Game(arcade.Window):
         return True
 
     def hurt_player(self, amount):
-        self.player.hp -= amount * DIFFICULTIES[self.difficulty][2] * self.armor
+        self.player.hp -= amount * self.rules.damage * self.armor
         self.player.hurt = 1.5
         if self.player.hp <= 0:
             self.end_match()
@@ -687,13 +765,12 @@ class Game(arcade.Window):
                 continue
             x,y = self.arena.route(z,target.x,target.y)
             dx,dy = x-z.x,y-z.y
-            for other in self.zombies:
-                if other is z or (x,y) != (target.x,target.y):
-                    continue
-                separation = distance(z,other)
-                if 0 < separation < z.radius+other.radius:
-                    dx += (z.x-other.x)*1.3
-                    dy += (z.y-other.y)*1.3
+            if (x,y) == (target.x,target.y):
+                for other in self.zombies:
+                    rx, ry = z.x-other.x, z.y-other.y
+                    if 0 < rx*rx+ry*ry < (z.radius+other.radius)**2:
+                        dx += rx*1.3
+                        dy += ry*1.3
             if self.arena.walk(z,dx,dy,z.speed*dt):
                 z.angle = math.atan2(dy,dx)
 
@@ -753,6 +830,71 @@ class Game(arcade.Window):
         if self.state == "play":
             self.check_upgrade()
 
+    def on_resize(self, width, height):
+        self.view_width, self.view_height = view_size(width, height)
+
+    def toggle_display(self):
+        self.firing = False
+        self.switching_display = True
+        try:
+            self.set_fullscreen(not self.fullscreen)
+            self.on_resize(*self.get_size())
+        finally:
+            self.switching_display = False
+        try:
+            self.screen_path.write_text("fullscreen" if self.fullscreen else "windowed")
+        except OSError:
+            pass
+
+    def menu_buttons(self):
+        x, y = self.view_width/2, self.view_height/2
+        display = "Полный экран" if self.fullscreen else "В окне"
+        if self.state == "title":
+            left = x-440
+            return [
+                *(MenuButton(f"difficulty:{i}", rules.name, left+i*160, y+6, 151, 42,
+                             accent=COLORS[1] if self.difficulty == i else None)
+                  for i, rules in enumerate(DIFFICULTIES)),
+                MenuButton("classic", "Классическая карта", left, y-115, 231, 66, "1  /  Открытая арена", COLORS[1]),
+                MenuButton("generated", "Случайная карта", left+244, y-115, 231, 66, "2  /  Кварталы и укрытия", COLORS[0]),
+                MenuButton("display", display, left, y-184, 231, 43, "F11"),
+                MenuButton("quit", "Выйти", left+244, y-184, 231, 43),
+            ]
+        if self.state in ("pause", "over"):
+            pause = self.state == "pause"
+            return [
+                MenuButton("resume" if pause else "restart", "Продолжить" if pause else "Сыграть снова",
+                           x-206, y-15, 412, 58, "Esc" if pause else "Enter", COLORS[1]),
+                MenuButton("display", display, x-206, y-79, 412, 50, "F11"),
+                MenuButton("title", "Главное меню", x-206, y-137, 412, 46, "M"),
+            ]
+        if self.state == "upgrade":
+            return [
+                MenuButton(f"upgrade:{i}", UPGRADES[choice][0], x-462+i*312, y-56, 300, 112,
+                           UPGRADES[choice][1], COLORS[i])
+                for i, choice in enumerate(self.options)
+            ]
+        return []
+
+    def activate_menu(self, action):
+        name, _, value = action.partition(":")
+        if name == "difficulty":
+            self.difficulty = int(value)
+        elif name == "upgrade":
+            self.choose(int(value))
+        elif name == "display":
+            self.toggle_display()
+        elif name == "resume":
+            self.state = "play"
+        elif name == "title":
+            self.state = "title"
+        elif name == "quit":
+            self.close()
+        elif name == "restart":
+            self.reset(self.arena.generated)
+        elif name in ("classic", "generated"):
+            self.reset(name == "generated")
+
     def on_key_press(self, key, modifiers):
         k = arcade.key
         repeated = key in self.keys
@@ -760,12 +902,7 @@ class Game(arcade.Window):
         if repeated:
             return
         if key == k.F11 or (key == k.ENTER and modifiers & k.MOD_ALT):
-            self.firing = False
-            self.switching_display = True
-            try:
-                self.set_fullscreen(not self.fullscreen)
-            finally:
-                self.switching_display = False
+            self.toggle_display()
             return
         if self.state in ("title","over"):
             if key in NUMBERS[:2]:
@@ -776,6 +913,8 @@ class Game(arcade.Window):
                 self.keys.add(key)
             elif key == k.F2:
                 self.difficulty = (self.difficulty+1) % len(DIFFICULTIES)
+            elif key == k.M and self.state == "over":
+                self.state = "title"
         elif self.state == "upgrade":
             if key in NUMBERS[:3]:
                 self.choose(NUMBERS.index(key))
@@ -798,10 +937,8 @@ class Game(arcade.Window):
         self.keys.discard(key)
 
     def update_pointer(self, x, y):
-        left, bottom, w, h = fit_viewport(*self.get_size())
-        u, v = (x-left)/w, (y-bottom)/h
-        self.mouse = clamp(u, 0, 1)*WIDTH, clamp(v, 0, 1)*HEIGHT
-        return 0 <= u <= 1 and 0 <= v <= 1
+        w, h = self.get_size()
+        self.pointer_ratio = clamp(x/max(1,w),0,1), clamp(y/max(1,h),0,1)
 
     def on_mouse_motion(self, x, y, dx, dy):
         self.update_pointer(x, y)
@@ -810,9 +947,16 @@ class Game(arcade.Window):
         self.update_pointer(x, y)
 
     def on_mouse_press(self, x, y, button, modifiers):
-        inside = self.update_pointer(x, y)
-        if inside and button == arcade.MOUSE_BUTTON_LEFT and self.state == "play":
+        self.update_pointer(x, y)
+        if button != arcade.MOUSE_BUTTON_LEFT:
+            return
+        if self.state == "play":
             self.firing = True
+            return
+        for item in self.menu_buttons():
+            if item.contains(self.pointer):
+                self.activate_menu(item.action)
+                break
 
     def on_mouse_release(self, x, y, button, modifiers):
         if button == arcade.MOUSE_BUTTON_LEFT:
@@ -842,42 +986,42 @@ class Game(arcade.Window):
 
     def draw_arena(self, ox, oy):
         arena = self.arena
-        box(0, 0, WIDTH, HEIGHT, (20,28,28))
+        box(0, 0, self.view_width, self.view_height, (20,28,28))
         tile = 192
-        for x in range(int(ox)//tile*tile, int(ox+WIDTH)+1, tile):
-            for y in range(int(oy)//tile*tile, int(oy+HEIGHT)+1, tile):
+        for x in range(int(ox)//tile*tile, int(ox+self.view_width)+1, tile):
+            for y in range(int(oy)//tile*tile, int(oy+self.view_height)+1, tile):
                 self.texture("ground", x+tile/2-ox, y+tile/2-oy, tile, tile)
         for lane in arena.lanes_x:
             x = lane-ox
-            if not -arena.road < x < WIDTH+arena.road:
+            if not -arena.road < x < self.view_width+arena.road:
                 continue
             box(x-arena.road/2-4, -oy, arena.road+8, SIZE, (89,99,88))
-            for y in range(max(0,int(oy)//tile*tile), min(SIZE,int(oy+HEIGHT)+1), tile):
+            for y in range(max(0,int(oy)//tile*tile), min(SIZE,int(oy+self.view_height)+1), tile):
                 height = min(tile,SIZE-y)
                 self.texture("asphalt", x, y+height/2-oy, arena.road, height)
-            for y in range(max(0,int(oy)//84*84), min(SIZE-30,int(oy+HEIGHT)+1), 84):
+            for y in range(max(0,int(oy)//84*84), min(SIZE-30,int(oy+self.view_height)+1), 84):
                 box(x-1,y-oy,2,30,(134,126,89))
         for lane in arena.lanes_y:
             y = lane-oy
-            if not -arena.road < y < HEIGHT+arena.road:
+            if not -arena.road < y < self.view_height+arena.road:
                 continue
             box(-ox, y-arena.road/2-4, SIZE, arena.road+8, (89,99,88))
-            for x in range(max(0,int(ox)//tile*tile), min(SIZE,int(ox+WIDTH)+1), tile):
+            for x in range(max(0,int(ox)//tile*tile), min(SIZE,int(ox+self.view_width)+1), tile):
                 width = min(tile,SIZE-x)
                 self.texture("asphalt", x+width/2-ox, y, width, arena.road)
-            for x in range(max(0,int(ox)//84*84), min(SIZE-30,int(ox+WIDTH)+1), 84):
+            for x in range(max(0,int(ox)//84*84), min(SIZE-30,int(ox+self.view_width)+1), 84):
                 box(x-ox,y-1,30,2,(134,126,89))
         for lane_x in arena.lanes_x:
             for lane_y in arena.lanes_y:
                 x, y = lane_x-ox, lane_y-oy
                 size = arena.plaza if arena.generated else arena.road
-                if -size < x < WIDTH+size and -size < y < HEIGHT+size:
+                if -size < x < self.view_width+size and -size < y < self.view_height+size:
                     self.texture("concrete", x, y, size, size)
                     arcade.draw_lbwh_rectangle_outline(x-size/2+5,y-size/2+5,size-10,size-10,(100,112,99),1)
         arcade.draw_lbwh_rectangle_outline(5-ox,5-oy,SIZE-10,SIZE-10,(193,139,75),8)
         for c in arena.cover:
             x, y = c.x-ox, c.y-oy
-            if x < WIDTH and y < HEIGHT and x+c.w > 0 and y+c.h > 0:
+            if x < self.view_width and y < self.view_height and x+c.w > 0 and y+c.h > 0:
                 item = COVER_TYPES[c.kind][2]
                 box(x+7,y-7,c.w,c.h,(11,22,20,165))
                 if c.w >= c.h:
@@ -888,7 +1032,7 @@ class Game(arcade.Window):
     def draw_units(self, ox, oy):
         for item in self.loot:
             x, y = item.x-ox, item.y-oy
-            if not (-45 < x < WIDTH+45 and -45 < y < HEIGHT+45):
+            if not (-45 < x < self.view_width+45 and -45 < y < self.view_height+45):
                 continue
             if item.weapon:
                 arcade.draw_circle_outline(x,y,18,COLORS[1],1)
@@ -901,7 +1045,7 @@ class Game(arcade.Window):
             )
         for z in self.zombies:
             x, y = z.x-ox, z.y-oy
-            if not (-150 < x < WIDTH+150 and -150 < y < HEIGHT+150):
+            if not (-150 < x < self.view_width+150 and -150 < y < self.view_height+150):
                 continue
             size = z.radius*3.35
             frame = 1+int(z.stride/11)%2 if z.walking else 0
@@ -921,13 +1065,14 @@ class Game(arcade.Window):
         f = self.player
         if f.hp > 0:
             x, y = f.x-ox, f.y-oy
-            sprite, angle = ("player_walk", f.move_angle) if f.walking else ("player_idle", f.angle)
+            pose = "player_walk" if f.walking else "player_idle"
+            angle = f.move_angle if f.walking and not self.firing else f.angle
+            if f.muzzle_flash:
+                angle = f.shot_angle
             arcade.draw_ellipse_filled(x+3,y-4,29,22,(11,19,18,180))
-            self.texture(sprite, x, y, 48, 48, angle)
-            dx, dy = math.cos(f.angle), math.sin(f.angle)
-            length = f.weapon.muzzle+7
-            grip = f.weapon.muzzle-length*.43
-            self.texture(f.weapon.sprite, x+dx*grip, y+dy*grip, length, length*.375, f.angle)
+            model = self.player_models[f.weapon.sprite, pose]
+            arcade.draw_texture_rect(model, arcade.XYWH(x,y,96,72), angle=math.degrees(angle))
+            dx, dy = math.cos(angle), math.sin(angle)
             if f.muzzle_flash:
                 mx, my = f.x+dx*f.weapon.muzzle, f.y+dy*f.weapon.muzzle
                 wall_at, cover = self.arena.obstruction(f.x, f.y, mx, my)
@@ -947,106 +1092,187 @@ class Game(arcade.Window):
                 arcade.draw_line(start_x-ox,start_y-oy,x,y,(255,189,79,135),1)
             self.texture("bullet", x, y, 12, 4.3, math.atan2(shot.vy,shot.vx))
 
+    def panel(self, x, y, w, h, color=(20,29,32,244), edge=(57,73,76)):
+        box(x, y, w, h, color)
+        arcade.draw_lbwh_rectangle_outline(x+.5, y+.5, w-1, h-1, edge, 1)
+
+    def meter(self, x, y, w, h, value, color):
+        box(x, y, w, h, (49,62,64))
+        if value > 0:
+            box(x, y, w*clamp(value,0,1), h, color)
+
     def draw_hud(self, ox, oy):
-        box(0,HEIGHT-71,WIDTH,71,(13,21,23))
-        self.label("brand","ЗОНА 04",24,HEIGHT-30,20,COLORS[0],bold=True)
-        mode = "СЛУЧАЙНАЯ КАРТА" if self.arena.generated else "КЛАССИЧЕСКАЯ КАРТА"
-        self.label("mode",f"{mode}  /  {DIFFICULTIES[self.difficulty][0]}",25,HEIGHT-52,10)
-        threats = len(self.zombies)+self.spawn_left
-        status = (f"ВОЛНА {self.wave:02}   /   УГРОЗЫ {threats}" if threats
-                  else f"ДО ВОЛНЫ {self.wave+1:02}   /   {math.ceil(self.break_time)} с")
-        self.label("wave",status,WIDTH/2,HEIGHT-31,16,center=True,bold=True)
-        self.label("level",f"УРОВЕНЬ {self.level}",WIDTH/2,HEIGHT-54,10,COLORS[0],True)
-        minutes,seconds = divmod(int(self.match_time),60)
-        self.label("score",f"УСТРАНЕНО {self.kills:03}   {minutes:02}:{seconds:02}",930,HEIGHT-32)
-        box(0,HEIGHT-73,WIDTH,3,(57,73,67))
-        box(0,HEIGHT-73,WIDTH*self.xp/self.xp_goal,3,COLORS[0])
-        box(0,0,WIDTH,91,(13,21,23))
+        w,h = self.view_width,self.view_height
+        center = w/2
         p = self.player
-        color = p.color
-        box(20, 13, 250, 63, (25,36,37))
-        self.texture("player_idle", 55, 45, 61, 61)
-        self.label("name", p.name, 89, 53, 14, color, bold=True)
-        self.label("hp", f"ЗДОРОВЬЕ {math.ceil(p.hp):02} / 100", 89, 32, 10)
-        box(89, 23, 164, 3, (67,84,81))
-        box(89, 23, 164*p.hp/100, 3, color)
-        self.texture(p.weapon.sprite, 325, 44, 70, 27)
-        self.label("gun", p.weapon.name, 366, 38, 14)
-        ammo = "ПЕРЕЗАРЯДКА" if p.reload > 0 else f"{p.magazine:02}  /  {p.reserve:03}"
-        self.label("ammo",ammo,730,37,21,p.color,bold=True)
-        self.label("reload","R  ПЕРЕЗАРЯДИТЬ",731,18,10)
-        self.label("controls","WASD ХОДЬБА   ЛКМ ОГОНЬ   ESC ПАУЗА",914,57,10)
-        self.label("display", "F11  ПОЛНЫЙ ЭКРАН", 914, 39, 10)
-        dash_left = max(0,p.dash_ready-self.match_time)
-        self.label("dash",f"ПРОБЕЛ  РЫВОК  {dash_left:.1f} с" if dash_left else "ПРОБЕЛ  РЫВОК ГОТОВ",914,21,10,p.color)
+        teal, gold, muted = COLORS[0], COLORS[1], (157,177,179)
+        self.panel(22,h-80,248,58)
+        self.label("brand","ЗОНА 04",39,h-45,19,teal,bold=True)
+        mode = "Случайная" if self.arena.generated else "Классическая"
+        self.label("mode",f"{mode}  /  {self.rules.name}",39,h-65,10,muted)
+
+        self.panel(center-145,h-98,290,76)
+        threats = len(self.zombies)+self.spawn_left
+        title = f"ВОЛНА {self.wave:02}" if threats else f"ВОЛНА {self.wave+1:02}  ·  {math.ceil(self.break_time)} с"
+        self.label("wave",title,center,h-56,21,gold,True,True)
+        detail = f"{threats} осталось   ·   {self.kills} устранено" if threats else f"Устранено {self.kills}"
+        self.label("threats",detail,center,h-80,11,muted,True)
         if self.match_time < self.notice_until:
-            self.label("notice",self.notice,WIDTH/2,HEIGHT-104,13,COLORS[1],True,True)
+            self.label("notice",self.notice,center,h-125,13,gold,True,True)
+
+        self.panel(22,22,270,80)
+        self.texture("player_idle",58,62,63,63)
+        hp_color = (252,127,114) if p.hp < 33 else teal
+        self.label("hp_title","ЗДОРОВЬЕ",93,74,10,muted)
+        self.label("hp",f"{math.ceil(p.hp):02} / 100",93,49,17,hp_color,bold=True)
+        self.meter(93,35,176,5,p.hp/100,hp_color)
+
+        self.panel(center-144,22,288,80)
+        self.label("level",f"УРОВЕНЬ {self.level}     {self.xp} / {self.xp_goal} ОПЫТА",
+                   center,77,11,teal,True,True)
+        self.meter(center-119,62,238,4,self.xp/self.xp_goal,teal)
+        dash_left = max(0,p.dash_ready-self.match_time)
+        hint = f"ПРОБЕЛ   Рывок через {dash_left:.1f} с" if dash_left else "ПРОБЕЛ   Рывок готов"
+        self.label("dash",hint,center,39,11,muted if dash_left else gold,True)
+
+        right = w-313
+        self.panel(right,22,291,80)
+        self.texture(p.weapon.sprite,right+47,62,69,26)
+        self.label("gun",p.weapon.name,right+91,78,11,muted)
+        self.label("reload","R",right+258,34,11,muted)
+        if p.reload > 0:
+            self.label("reloading","Перезарядка",right+91,47,15,gold,bold=True)
+            remaining = p.reload*self.reload_speed/p.weapon.reload_time
+            self.meter(right+91,34,158,3,1-remaining,gold)
+        else:
+            ammo = f"{p.magazine:02}  /  {p.reserve:03}"
+            self.label("ammo",ammo,right+91,44,21,gold if p.magazine == 0 else teal,bold=True)
+
         ammo_drop,weapon_drop = self.nearby(False),self.nearby(True)
         actions = []
         if ammo_drop:
-            actions.append("E  подобрать припасы" if ammo_drop.heal else "E  подобрать патроны")
+            actions.append("E   Припасы" if ammo_drop.heal else "E   Патроны")
         if weapon_drop:
-            actions.append(f"F  взять оружие «{weapon_drop.weapon.name}»")
+            actions.append(f"F   {weapon_drop.weapon.name}")
         if actions and p.hp > 0:
-            box(255,105,690,39,(12,21,22,235))
-            self.label("loot","    /    ".join(actions),WIDTH/2,118,13,COLORS[1],True)
-        x,y,scale = 1054,540,125/SIZE
-        box(x-4,y-4,133,133,(12,20,20,228))
-        arcade.draw_lbwh_rectangle_outline(x,y,125,125,(92,117,105),1)
-        bottom, top = max(0, oy), min(SIZE, oy+HEIGHT)
+            self.panel(center-244,109,488,35,(17,25,28,236))
+            self.label("loot","     /     ".join(actions),center,120,12,gold,True,True)
+
+        x,y,size = w-173,h-198,137
+        scale = size/SIZE
+        self.panel(x-7,y-7,size+14,size+46)
+        minutes, seconds = divmod(int(self.match_time),60)
+        self.label("score",f"{minutes:02}:{seconds:02}  ·  ESC ПАУЗА",x+7,y+153,9,muted)
+        arcade.draw_lbwh_rectangle_outline(x,y,size,size,(76,97,102),1)
+        bottom, top = max(0,oy), min(SIZE,oy+h)
         arcade.draw_lbwh_rectangle_outline(
-            x+ox*scale, y+bottom*scale, WIDTH*scale, (top-bottom)*scale, (71,110,103), 1
+            x+ox*scale,y+bottom*scale,min(SIZE-ox,w)*scale,(top-bottom)*scale,(74,126,125),1
         )
         for c in self.arena.cover:
             box(x+c.x*scale,y+c.y*scale,c.w*scale,c.h*scale,(105,111,91))
         for z in self.zombies:
-            arcade.draw_circle_filled(x+z.x*scale,y+z.y*scale,1.6,(206,116,102))
+            arcade.draw_circle_filled(x+z.x*scale,y+z.y*scale,2.8 if z.boss else 1.5,(239,120,102))
         if p.hp > 0:
-            arcade.draw_circle_filled(x+p.x*scale,y+p.y*scale,3,p.color)
+            arcade.draw_circle_filled(x+p.x*scale,y+p.y*scale,3,teal)
+
+    def draw_button(self, item):
+        hover = item.contains(self.pointer)
+        accent = item.accent or (232,240,235)
+        fill = (48,63,64) if hover else (27,40,43)
+        edge = accent if hover or item.accent else (60,78,82)
+        self.panel(item.x,item.y,item.w,item.h,fill,edge)
+        if item.accent:
+            box(item.x+1,item.y+1,3,item.h-2,accent)
+        tx = item.x+15
+        if self.state == "upgrade":
+            index = int(item.action.split(":")[1])+1
+            self.label(f"key:{item.action}", f"{index}",tx,item.y+item.h-31,12,accent,bold=True)
+            self.label(f"button:{item.action}",item.title,tx,item.y+46,16,bold=True)
+            self.label(f"hint:{item.action}",item.hint,tx,item.y+22,10,(178,197,198))
+        elif item.h >= 60:
+            self.label(f"button:{item.action}",item.title,tx,item.y+33,12,bold=True)
+            self.label(f"hint:{item.action}",item.hint,tx,item.y+14,10,(173,191,191))
+        else:
+            self.label(f"button:{item.action}",item.title,tx,item.y+item.h/2-6,13,accent,bold=True)
+            if item.hint:
+                self.label(f"hint:{self.state}:{item.action}",item.hint,item.x+item.w-54,
+                           item.y+item.h/2-5,10,(173,191,191))
+
+    def draw_title(self, x, y):
+        self.panel(x-476,y-250,952,502,(16,25,29,254),(75,93,91))
+        box(x-476,y+248,952,4,COLORS[1])
+        left = x-440
+        self.label("title","ЗОНА 04",left,y+153,62,bold=True)
+        self.label("subtitle","ОДИН ПРОТИВ ОРДЫ",left,y+120,14,COLORS[1],bold=True)
+        self.label("difficulty_label","СЛОЖНОСТЬ",left,y+64,11,(173,191,191),bold=True)
+        self.label("difficulty_description",self.rules.description,left,y-19,12,(173,191,191))
+        self.label("keys","WASD   Движение     ЛКМ   Огонь     R   Перезарядка",
+                   left,y-224,11,(173,191,191))
+        self.panel(x+73,y-187,366,369,(24,39,39),(65,87,86))
+        box(x+74,y+166,364,15,(50,63,57))
+        for i in range(14):
+            arcade.draw_line(x+83+i*25,y+167,x+94+i*25,y+179,(180,152,91),2)
+        for name,dx,dy,size,angle in (
+            ("walker_1", 209,78,100,-1.1), ("armored_0",340,84,120,-2),
+            ("runner_1",354,-38,100,-2.9), ("charger_1",175,-58,95,.35),
+        ):
+            self.texture(name,x+dx,y+dy,size,size,angle)
+        p = self.player
+        model = self.player_models[p.weapon.sprite, "player_idle"]
+        arcade.draw_texture_rect(model,arcade.XYWH(x+267,y-2,285,214),angle=34)
+        self.label("record",f"РЕКОРД   {self.best} УСТРАНЕНО",
+                   x+256,y-154,12,COLORS[1],True,True)
 
     def draw_overlay(self):
-        box(0,0,WIDTH,HEIGHT,(8,15,16,220))
-        title,lines = {
-            "title": ("ЗОНА 04", ("Один против орды",
-                      "1  Классическая карта     /     2  Случайная карта",
-                      "WASD или стрелки — ходьба    /    ЛКМ — огонь    /    R — перезарядка",
-                      "E — припасы    /    F — оружие",
-                      f"Пробел — рывок    /    F2 — сложность: {DIFFICULTIES[self.difficulty][0]}",
-                      "F11 или Alt+Enter — полный экран")),
-            "pause": ("ПАУЗА",("ESC  Продолжить    /    M  В меню",)),
-            "upgrade": (f"УРОВЕНЬ {self.level}",("Выбери одно улучшение",)),
-            "over": ("ТЫ ПОГИБ",(f"Волна {self.wave}   /   Устранено {self.kills}   /   Рекорд {self.best}",
-                     "ENTER  Повторить режим     /     1  Классическая     /     2  Случайная",
-                     f"F2  Сложность: {DIFFICULTIES[self.difficulty][0]}")),
-        }[self.state]
-        self.label("overlay",title,WIDTH/2,467,55,COLORS[0],True,True)
-        for i,line in enumerate(lines):
-            self.label(f"overlay{i}",line,WIDTH/2,422-i*36,17,center=True)
-        if self.state == "upgrade":
-            for i,choice in enumerate(self.options):
-                x = 79+i*350
-                title,description = UPGRADES[choice]
-                box(x,264,342,110,(28,47,48))
-                box(x,264,342,3,COLORS[i])
-                self.label(f"opt{i}",f"{i+1}   {title}",x+16,327,17,COLORS[i],bold=True)
-                self.label(f"desc{i}",description,x+16,294,11)
+        x,y = self.view_width/2,self.view_height/2
+        box(0,0,self.view_width,self.view_height,(8,14,17,188))
+        if self.state == "title":
+            self.draw_title(x,y)
+        elif self.state == "upgrade":
+            self.panel(x-484,y-99,968,250,(16,25,29,251))
+            self.label("upgrade_title",f"УРОВЕНЬ {self.level}",x,y+96,32,COLORS[1],True,True)
+            self.label("upgrade_hint","Выбери одно улучшение",x,y+70,12,(170,185,185),True)
+        else:
+            self.panel(x-236,y-166,472,342,(16,25,29,252))
+            pause = self.state == "pause"
+            self.label("overlay","ПАУЗА" if pause else "ТЫ ПОГИБ",x,y+103,40,COLORS[1],True,True)
+            detail = f"Волна {self.wave}   ·   Устранено {self.kills}"
+            if not pause:
+                detail += f"   ·   Рекорд {self.best}"
+            self.label("result",detail,x,y+66,12,(173,191,191),True)
+        for item in self.menu_buttons():
+            self.draw_button(item)
 
     def on_draw(self):
+        self.on_resize(*self.get_size())
         self.clear((9,14,16))
-        self.canvas.viewport = arcade.LBWH(*fit_viewport(*self.get_framebuffer_size()))
-        with self.canvas.activate():
+        fb_w, fb_h = self.get_framebuffer_size()
+        if min(fb_w, fb_h) <= 0:
+            return
+        self.game_camera.viewport = arcade.LBWH(0,0,fb_w,fb_h)
+        self.game_camera.projection = arcade.LRBT(0,self.view_width,0,self.view_height)
+        with self.game_camera.activate():
             ox, oy = self.origin
             self.draw_arena(ox, oy)
             self.draw_units(ox, oy)
-            self.draw_hud(ox, oy)
+            if self.state != "title":
+                self.draw_hud(ox, oy)
             if self.state == "play":
-                x, y = self.mouse
-                color = (232,241,224)
+                if self.player.hp < 33:
+                    amount = int((33-self.player.hp)*2)
+                    arcade.draw_lbwh_rectangle_outline(0,0,self.view_width,self.view_height,
+                                                      (229,79,63,amount),11)
+                x,y = self.pointer
+                color = (244,239,220)
                 arcade.draw_circle_outline(x,y,8,color,1)
                 arcade.draw_line(x-12,y,x-6,y,color,1)
                 arcade.draw_line(x+6,y,x+12,y,color,1)
             else:
                 self.draw_overlay()
+        hide = self.state == "play"
+        if self.cursor_hidden != hide:
+            self.set_mouse_visible(not hide)
+            self.cursor_hidden = hide
 
 
 if __name__ == "__main__":
@@ -1056,8 +1282,9 @@ if __name__ == "__main__":
         )
         if not shader.read_bytes():
             raise RuntimeError("Arcade shader is empty")
-        if len(load_art()) != len(ASSET_NAMES):
-            raise RuntimeError("Game sprite list contains duplicate names")
+        art = load_art()
+        if len(art) != len(ASSET_NAMES) or len(load_player_models(art)) != 20:
+            raise RuntimeError("Game sprite list is incomplete")
     else:
         Game()
         arcade.run()
