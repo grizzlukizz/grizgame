@@ -24,7 +24,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Copy-Item -Path README.md,quarantine.py,requirements.txt -Destination dist/Zone04
+          Copy-Item -Path README.md,quarantine.py,requirements.txt,Create-Desktop-Shortcut.bat -Destination dist/Zone04
           python -c "import shutil; shutil.make_archive('Zone04-Windows', 'zip', 'dist', 'Zone04')"
           if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
           Expand-Archive -Path Zone04-Windows.zip -DestinationPath verification
@@ -38,6 +38,16 @@ jobs:
             throw 'Packaged executable did not finish its startup check'
           }
           if ($probe.ExitCode -ne 0) { throw "Packaged executable failed its startup check: $($probe.ExitCode)" }
+          & (Join-Path $game 'Create-Desktop-Shortcut.bat') --quiet
+          if ($LASTEXITCODE -ne 0) { throw 'Creating the desktop shortcut failed' }
+          $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+          $shortcutPath = Join-Path $desktop 'Zone 04.lnk'
+          if (!(Test-Path $shortcutPath)) { throw 'Desktop shortcut is missing' }
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcut = $shell.CreateShortcut($shortcutPath)
+          if ($shortcut.TargetPath -ne $exe -or $shortcut.WorkingDirectory.TrimEnd([char]92) -ne $game) {
+            throw 'Desktop shortcut points to the wrong location'
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: Zone04-Windows
