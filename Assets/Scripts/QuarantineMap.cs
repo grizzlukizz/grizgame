@@ -8,6 +8,8 @@ namespace Zone04
         public const float Edge = 46;
         public readonly Transform Root;
         private readonly List<Rect> obstacles = new();
+        private QuarantineNavigation regularRoutes, heavyRoutes;
+        internal IReadOnlyList<Rect> CoverAreas => obstacles;
 
         public QuarantineMap(Transform parent, bool generated, int seed)
         {
@@ -50,27 +52,28 @@ namespace Zone04
                     bool roadway = false;
                     foreach (float lane in lanes)
                         roadway |= Mathf.Abs(px-lane)<5.4f || Mathf.Abs(pz-lane)<5.4f;
-                    if (!roadway) AddCover(px,pz,rng.Next(4),rng.Next(2)==0);
+                    if (!roadway) AddCover(px,pz,rng.Next(6),rng.Next(2)==0);
                 }
             }
             else
             {
                 AddCover(-11,12,0,false); AddCover(13,10,2,true);
                 AddCover(-12,-13,1,true); AddCover(14,-12,3,false);
-                AddCover(30,14,0,true); AddCover(-29,-18,3,false);
+                AddCover(30,14,4,true); AddCover(-29,-18,3,false);
+                AddCover(9,29,5,false); AddCover(-28,24,2,true);
             }
         }
 
         private void AddCover(float x,float z,int kind,bool rotated)
         {
-            float width = kind==1 ? 5.8f : kind==3 ? 4.6f : 4.0f;
-            float depth = kind==1 ? 2.05f : 2.2f;
-            float height = kind==0 ? 2.24f : kind==1 ? 1.93f : kind==2 ? .92f : .65f;
+            float width = kind switch { 1=>5.8f, 3=>4.6f, 4=>4.6f, 5=>3.2f, _=>4.0f };
+            float depth = kind switch { 1=>2.05f, 4=>3.2f, 5=>2.6f, _=>2.2f };
+            float height = kind switch { 0=>2.24f, 1=>1.93f, 2=>.92f, 4=>2.6f, 5=>2.04f, _=>.65f };
             var root = Models.Node(Root,"Cover",new Vector3(x,0,z));
             root.localRotation = Quaternion.Euler(0,rotated ? 90 : 0,0);
             obstacles.Add(new Rect(x-(rotated?depth:width)/2,z-(rotated?width:depth)/2,
                 rotated?depth:width,rotated?width:depth));
-            string[] colors = { "437C81", "D5AD60", "A98158", "8DA17C" };
+            string[] colors = { "437C81", "D5AD60", "A98158", "8DA17C", "68759B", "BB7268" };
             Models.Block(root,"Main body",new Vector3(0,height/2,0),width,height,depth,colors[kind]);
             if (kind==0 || kind==2)
             {
@@ -87,6 +90,18 @@ namespace Zone04
                     for (int i=-1; i<=1; i+=2)
                         Models.Block(root,"Tire",new Vector3(i*1.75f,.41f,side*(depth/2-.04f)),.63f,.62f,.15f,"333945");
                 }
+            }
+            if (kind==4 || kind==5)
+            {
+                Models.Block(root,"Roof",new Vector3(0,height,0),width+.16f,.15f,depth+.18f,
+                    kind==4?"8996B0":"E3A376");
+                Models.Block(root,"Window band",new Vector3(0,height*.65f,depth/2),width*.71f,.38f,.055f,"36596E");
+                for(int j=-1;j<=1;j+=2)
+                    Models.Block(root,"Roof vent",new Vector3(j*.63f,height+.19f,-.21f),.43f,.27f,.57f,"546A78");
+                if(kind==5)
+                    for(int j=-3;j<=3;j++)
+                        Models.Block(root,"Awning",new Vector3(j*.4f,height*.81f,depth/2+.26f),
+                            .39f,.13f,.56f,j%2==0?"F1D2A1":"A95758");
             }
             if (kind == 3)
                 for (int i=-2;i<=2;i++)
@@ -114,6 +129,17 @@ namespace Zone04
             hit = FirstCover(cursor,yOnly,radius);
             cursor.y = Mathf.Lerp(cursor.y,yOnly.y,hit<1 ? Mathf.Max(0,hit-.001f) : 1);
             return cursor;
+        }
+
+        public Vector2 Guide(Vector2 start, Vector2 target, float radius)
+        {
+            if (FirstCover(start,target,radius)>=1) return target;
+            QuarantineNavigation routes = radius>.55f
+                ? heavyRoutes ??= new QuarantineNavigation(this,.72f)
+                : regularRoutes ??= new QuarantineNavigation(this,.53f);
+            if (routes.TryGuide(start,target,radius,out Vector2 waypoint))
+                return waypoint;
+            return Pursuit(start,target,radius);
         }
 
         public Vector2 Pursuit(Vector2 start,Vector2 target,float radius)

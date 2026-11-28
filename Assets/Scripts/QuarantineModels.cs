@@ -86,10 +86,10 @@ namespace Zone04
         public ActorModel(Transform parent, string name, int variant, bool player)
         {
             human = player;
-            baseScale = variant == 5 ? 1.45f : variant == 2 ? 1.17f : variant == 1 ? .89f : 1;
-            string[] coats = { "466845", "AB584B", "596A79", "848C44", "855C99", "7F3F48" };
+            baseScale = variant == 5 ? 1.45f : variant == 2 || variant == 6 ? 1.17f : variant == 1 ? .89f : 1;
+            string[] coats = { "466845", "AB584B", "596A79", "848C44", "855C99", "7F3F48", "C48544" };
             string coat = player ? "327583" : coats[variant];
-            string accent = player ? "76E2DF" : variant == 3 ? "BDEA6B" : variant == 4 ? "FF9ADD" : "A7C486";
+            string accent = player ? "76E2DF" : variant == 3 ? "BDEA6B" : variant == 4 ? "FF9ADD" : variant == 6 ? "FFD783" : "A7C486";
             string dark = player ? "253D48" : variant == 2 ? "404E5C" : "43413B";
             string skin = player ? "B78D68" : variant == 4 ? "C896BB" : "A4B67A";
 
@@ -121,6 +121,9 @@ namespace Zone04
                 Models.Block(head,"Jaw",new Vector3(0,.066f,.149f),.18f,.075f,.075f,"694E4E");
                 for (int side = -1; side <= 1; side += 2)
                     Models.Block(head,"Eye",new Vector3(side*.068f,.17f,.158f),.05f,.036f,.044f,accent);
+                if (variant == 6)
+                    for(int side=-1; side<=1; side+=2)
+                        Models.Block(head,"Head plate",new Vector3(side*.15f,.22f,.09f),.12f,.19f,.27f,accent);
                 if (variant == 3 || variant == 4)
                     Models.Part(torso, "Growth", "bush", new Vector3(.07f,.43f,-.20f),
                         new Vector3(.36f,.52f,.29f),accent);
@@ -163,27 +166,31 @@ namespace Zone04
                 Object.Destroy(weapon.gameObject);
             }
             weapon = Models.Node(torso,"Weapon",new Vector3(.22f,.29f,.49f));
-            float length = index == 0 ? .85f : index == 1 ? 1.04f : index == 2 ? .66f : 1.14f;
-            string[] finishes = { "5C8890", "BD7B4B", "7D9B9D", "7F9C5D" };
+            float[] lengths={.85f,1.04f,.66f,1.14f,1.08f,1.32f};
+            float length=lengths[index];
+            string[] finishes = { "5C8890", "BD7B4B", "7D9B9D", "7F9C5D", "9A8A55", "6675AA" };
             Models.Block(weapon,"Receiver",Vector3.zero,.15f,.17f,length*.61f,finishes[index]);
             Models.Block(weapon,"Stock",new Vector3(0,-.026f,-length*.41f),.15f,.20f,length*.25f,"273A44");
             Models.Block(weapon,"Magazine",new Vector3(0,-.14f,.01f),.10f,.18f,.17f,"353942");
             Transform muzzle = Models.Part(weapon,"Barrel","barrel", new Vector3(0,.023f,length*.41f),
                 new Vector3(.077f,length*.38f,.077f),"374B56");
             muzzle.localRotation = Quaternion.Euler(90,0,0);
-            if (index == 3)
+            if (index == 4)
+                Models.Block(weapon,"Belt box",new Vector3(.085f,-.105f,.02f),.22f,.23f,.25f,"886747");
+            if (index == 3 || index == 5)
                 Models.Block(weapon,"Scope",new Vector3(0,.12f,.035f),.075f,.083f,.21f,"B3C3BD");
         }
 
-        public void Animate(float dt, float move, float bodyYaw, float aimYaw,
-            float dash, float attack, float recoil, float reload, bool dead = false)
+        public void Collapse(float yaw,float fraction)
         {
-            if (dead)
-            {
-                Root.rotation = Quaternion.Euler(0,bodyYaw,75);
-                hips.localPosition = new Vector3(0,.28f,0);
-                return;
-            }
+            float t=Mathf.Clamp01(fraction);
+            Root.rotation=Quaternion.Euler(0,yaw,Mathf.SmoothStep(0,79,t));
+            hips.localPosition=new Vector3(0,Mathf.SmoothStep(.86f,.31f,t),0);
+        }
+
+        public void Animate(float dt, float move, float bodyYaw, float aimYaw,
+            float dash, float attack, float recoil, float reload)
+        {
             cycle += dt * (human ? 10.5f : 8f) * Mathf.Lerp(.4f,1.45f,move);
             float swing = Mathf.Sin(cycle)*move;
             Root.rotation = Quaternion.Euler(0,bodyYaw,0);

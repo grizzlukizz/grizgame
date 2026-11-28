@@ -5,15 +5,15 @@ namespace Zone04
 {
     public sealed class Quarantine : MonoBehaviour
     {
-        private enum ScreenState { Title, Playing, Pause, Upgrade, Defeat }
-        private enum EnemyKind { Walker, Runner, Armored, Spitter, Caller, Boss }
+        private enum ScreenState { Title, Playing, Pause, Upgrade, Defeat, Victory }
+        private enum EnemyKind { Walker, Runner, Armored, Spitter, Caller, Boss, Charger }
 
         private sealed class Enemy
         {
             public EnemyKind Kind;
             public ActorModel Model;
             public Vector2 Position, Direction, Aim;
-            public float Hp, MaxHp, Armor, Speed, Radius, Windup, Cooldown, Swing, Stuck;
+            public float Hp, MaxHp, Armor, Speed, Radius, Windup, Cooldown, Swing, Charge;
             public bool Called;
         }
 
@@ -50,17 +50,21 @@ namespace Zone04
             new("Карабин",18,1,26,.24f,1.1f,46,30),
             new("Дробовик",7,6,11,.62f,1.6f,37,14),
             new("Пистолет-пулемёт",30,1,15,.12f,1.3f,41,23),
-            new("Винтовка",8,1,61,.64f,1.4f,57,37)
+            new("Винтовка",8,1,61,.64f,1.4f,57,37),
+            new("Ручной пулемёт",48,1,20,.11f,2.35f,47,30),
+            new("Марксманская винтовка",6,1,83,.75f,1.48f,66,44)
         };
         private static readonly string[] Upgrades =
         {
             "Усиленные патроны", "Лёгкое снаряжение", "Аптечка", "Запас патронов",
-            "Бронежилет", "Быстрые руки", "Быстрый рывок", "Длинные магазины"
+            "Бронежилет", "Быстрые руки", "Быстрый рывок", "Длинные магазины",
+            "Второе дыхание", "Дальнобойные пули", "Тренировка стрельбы"
         };
         private static readonly string[] UpgradeDetails =
         {
             "+25% урона", "+12% к скорости бега", "+35 здоровья", "+55 патронов",
-            "−15% получаемого урона", "−20% времени перезарядки", "−20% отката рывка", "+4 патрона в магазине"
+            "−15% получаемого урона", "−20% времени перезарядки", "−20% отката рывка", "+4 патрона в магазине",
+            "+20 к максимуму здоровья", "+25% к дальности", "+15% темпа огня"
         };
 
         private Camera view;
@@ -75,7 +79,12 @@ namespace Zone04
         private readonly List<Supply> supplies=new();
         private readonly List<int> choices=new();
         private ScreenState state;
-        private bool generated;
+        private bool generated, extractionEnabled;
+        private ExtractionMission extraction;
+        private Vector2 evacuationPoint;
+        private float raidTimer, hurtFlash, maxHp, rangeBoost, shotRate, fallTime;
+        private bool suppressShotUntilRelease;
+        private float displayGrace;
         private int difficulty=1, wave, remaining, kills, xp, level, best, weaponId, magazine, ammo, bonusMagazine;
         private float hp, spawnTimer, rest, shotTimer, reloadTimer, elapsed, dashReady, dashTime;
         private float damage, speed, armor, reloadMultiplier, dashCooldown, bodyYaw, aimYaw, recoil;
@@ -105,6 +114,7 @@ namespace Zone04
             best=PlayerPrefs.GetInt("Zone04.Best");
             difficulty=Mathf.Clamp(PlayerPrefs.GetInt("Zone04.Difficulty",1),0,2);
             showMap=PlayerPrefs.GetInt("Zone04.Map",1)==1;
+            extractionEnabled=PlayerPrefs.GetInt("Zone04.Extraction",0)==1;
             volume=Mathf.Clamp01(PlayerPrefs.GetFloat("Zone04.Volume",.6f));
             if (PlayerPrefs.HasKey("Zone04.Fullscreen"))
                 Screen.fullScreenMode=PlayerPrefs.GetInt("Zone04.Fullscreen")==1
@@ -158,9 +168,13 @@ namespace Zone04
             player=new ActorModel(arenaContents,"Scout",0,true);
             player.Equip(0);
             generated=randomMap;
+            extraction=extractionEnabled ? new ExtractionMission() : null;
+            raidTimer=hurtFlash=fallTime=0;
+            suppressShotUntilRelease=true;
+            rangeBoost=shotRate=1;
             enemies.Clear(); shots.Clear(); supplies.Clear();
             wave=remaining=kills=xp=bonusMagazine=weaponId=0;
-            level=1; hp=100; magazine=18; ammo=98;
+            level=1; maxHp=hp=100; magazine=18; ammo=108;
             rest=3; spawnTimer=shotTimer=reloadTimer=elapsed=dashReady=dashTime=0;
             damage=speed=armor=reloadMultiplier=1;
             dashCooldown=2.4f;
@@ -184,29 +198,44 @@ namespace Zone04
                 if (Input.GetKeyDown(KeyCode.Alpha2)) StartMatch(true);
             }
             else if (state==ScreenState.Pause && Input.GetKeyDown(KeyCode.Escape))
+            {
+                suppressShotUntilRelease=true;
                 state=ScreenState.Playing;
+            }
             else if (state==ScreenState.Upgrade)
             {
                 for (int i=0;i<3;i++)
                     if (Input.GetKeyDown((KeyCode)((int)KeyCode.Alpha1+i))) Choose(i);
             }
-            else if (state==ScreenState.Defeat && Input.GetKeyDown(KeyCode.Return))
+            else if ((state==ScreenState.Defeat || state==ScreenState.Victory) && Input.GetKeyDown(KeyCode.Return))
                 StartMatch(generated);
             else if (state==ScreenState.Playing)
             {
                 if (Input.GetKeyDown(KeyCode.Escape))
+                {
+                    suppressShotUntilRelease=true;
                     state=ScreenState.Pause;
+                }
                 else
                     Tick(Mathf.Min(.05f,Time.deltaTime));
             }
 
+            if(state==ScreenState.Defeat)
+            {
+                fallTime+=Time.unscaledDeltaTime;
+                player.Collapse(bodyYaw,fallTime/.33f);
+            }
             Cursor.visible=state!=ScreenState.Playing;
             view.orthographicSize=state==ScreenState.Title ? 11 : 14;
         }
 
         private void OnApplicationFocus(bool focused)
         {
-            if (!focused && state==ScreenState.Playing) state=ScreenState.Pause;
+            if (!focused && state==ScreenState.Playing && Time.unscaledTime>=displayGrace)
+            {
+                suppressShotUntilRelease=true;
+                state=ScreenState.Pause;
+            }
         }
 
         private static float Yaw(Vector2 vector)
@@ -226,6 +255,8 @@ namespace Zone04
         private void Tick(float dt)
         {
             elapsed+=dt;
+            hurtFlash=Mathf.Max(0,hurtFlash-dt);
+            if (!Input.GetMouseButton(0)) suppressShotUntilRelease=false;
             Vector2 key=new(
                 (Input.GetKey(KeyCode.D)||Input.GetKey(KeyCode.RightArrow)?1:0)-
                 (Input.GetKey(KeyCode.A)||Input.GetKey(KeyCode.LeftArrow)?1:0),
@@ -233,7 +264,7 @@ namespace Zone04
                 (Input.GetKey(KeyCode.S)||Input.GetKey(KeyCode.DownArrow)?1:0));
             key=key.normalized;
             Ray ray=view.ScreenPointToRay(Input.mousePosition);
-            if (new Plane(Vector3.up,Vector3.zero).Raycast(ray,out float hit))
+            if (new Plane(Vector3.up,Vector3.up*.82f).Raycast(ray,out float hit))
             {
                 Vector3 cursor=ray.GetPoint(hit);
                 Vector2 delta=new Vector2(cursor.x,cursor.z)-position;
@@ -273,7 +304,7 @@ namespace Zone04
                 }
             }
             if (Input.GetKeyDown(KeyCode.R)) Reload();
-            if (Input.GetMouseButton(0) && !dashing && reloadTimer<=0 && shotTimer<=0)
+            if (Input.GetMouseButton(0) && !suppressShotUntilRelease && !dashing && reloadTimer<=0 && shotTimer<=0)
                 TryFire();
             if (Input.GetKeyDown(KeyCode.E)) Collect(false);
             if (Input.GetKeyDown(KeyCode.F)) Collect(true);
@@ -284,7 +315,19 @@ namespace Zone04
             UpdateShots(dt);
             if (state!=ScreenState.Playing) return;
             UpdateEnemies(dt);
-            if (state==ScreenState.Playing && xp>=XpGoal) OfferUpgrade();
+            if(state!=ScreenState.Playing) return;
+            if(extraction!=null && extraction.Open)
+            {
+                extraction.Advance(dt,(position-evacuationPoint).sqrMagnitude<=3.6f*3.6f);
+                if(extraction.Complete)
+                {
+                    state=ScreenState.Victory;
+                    SaveBest();
+                    Sound("wave");
+                    return;
+                }
+            }
+            if(xp>=XpGoal) OfferUpgrade();
         }
 
         private void Dash(Vector2 direction)
@@ -317,14 +360,14 @@ namespace Zone04
             Weapon w=Weapons[weaponId];
             magazine--;
             Sound("shot",.8f);
-            shotTimer=w.Delay;
+            shotTimer=w.Delay/shotRate;
             recoil=1;
             for (int i=0;i<w.Pellets;i++)
             {
                 float spread=w.Pellets==1 ? 0 : (i-(w.Pellets-1)*.5f)*.075f;
                 Vector2 direction=new(aim.x*Mathf.Cos(spread)+aim.y*Mathf.Sin(spread),
                     aim.y*Mathf.Cos(spread)-aim.x*Mathf.Sin(spread));
-                AddProjectile(position,direction,w.Speed,w.Reach,w.Damage*damage,false);
+                AddProjectile(position,direction,w.Speed,w.Reach*rangeBoost,w.Damage*damage,false);
             }
         }
 
@@ -394,6 +437,20 @@ namespace Zone04
 
         private void UpdateWave(float dt)
         {
+            if(extraction!=null)
+            {
+                if(extraction.OpenAfter(wave,remaining,enemies.Count)) OpenEvacuation();
+                if(extraction.Open)
+                {
+                    raidTimer-=dt;
+                    if(raidTimer<=0 && enemies.Count<22 && FindSpawn(out Vector2 raidPoint))
+                    {
+                        Spawn(Random.value<.35f?EnemyKind.Charger:EnemyKind.Runner,raidPoint);
+                        raidTimer=1.15f;
+                    }
+                    return;
+                }
+            }
             if(remaining>0)
             {
                 spawnTimer-=dt;
@@ -402,7 +459,8 @@ namespace Zone04
                 EnemyKind kind=wave%5==0 && remaining==1 ? EnemyKind.Boss
                     : wave>=6 && roll<.14f ? EnemyKind.Caller
                     : wave>=4 && roll<.28f ? EnemyKind.Spitter
-                    : wave>=2 && roll<.47f ? EnemyKind.Armored
+                    : wave>=3 && roll<.41f ? EnemyKind.Charger
+                    : wave>=2 && roll<.54f ? EnemyKind.Armored
                     : wave>=2 && roll<.73f ? EnemyKind.Runner : EnemyKind.Walker;
                 if(!FindSpawn(out Vector2 point)) {spawnTimer=.12f;return;}
                 Spawn(kind,point);
@@ -419,7 +477,7 @@ namespace Zone04
                 rest=5-difficulty;
                 spawnTimer=0;
                 if(wave>1 && FindSupply(out Vector2 point))
-                    Drop(point,wave%2==0?1+(wave/2-1)%3:-1,38,16);
+                    Drop(point,wave%2==0?1+(wave/2-1)%(Weapons.Length-1):-1,38,16);
                 Announce(wave%5==0 ? "Волна "+wave+" — громила" : "Волна "+wave);
             }
         }
@@ -432,6 +490,14 @@ namespace Zone04
                 float radius=Random.Range(20f,34f);
                 Vector2 candidate=position+new Vector2(Mathf.Sin(angle),Mathf.Cos(angle))*radius;
                 if(map.Blocked(candidate,1.3f)) continue;
+                bool occupied=false;
+                foreach(Enemy enemy in enemies)
+                {
+                    if((enemy.Position-candidate).sqrMagnitude>=2.25f) continue;
+                    occupied=true;
+                    break;
+                }
+                if(occupied) continue;
                 Vector3 projected=view.WorldToViewportPoint(World(candidate));
                 if(projected.x>-.03f && projected.x<1.03f && projected.y>-.03f && projected.y<1.03f) continue;
                 point=candidate;
@@ -450,7 +516,42 @@ namespace Zone04
                 float distance=(corner-position).sqrMagnitude;
                 if(!map.Blocked(corner,1.3f)&&distance>best) {point=corner;best=distance;}
             }
+            if(best>=0) return true;
+            foreach(int x in new[]{-1,1})
+            foreach(int z in new[]{-1,1})
+            {
+                Vector2 corner=new(x*44,z*44);
+                float distance=(corner-position).sqrMagnitude;
+                if(!map.Blocked(corner,1.3f)&&distance>best) {point=corner;best=distance;}
+            }
             return best>=0;
+        }
+
+        private void OpenEvacuation()
+        {
+            evacuationPoint=Vector2.zero;
+            for(int i=0;i<36;i++)
+            {
+                float angle=i*Mathf.PI/18;
+                Vector2 candidate=position+new Vector2(Mathf.Sin(angle),Mathf.Cos(angle))*17;
+                if(map.Blocked(candidate,3.7f)) continue;
+                evacuationPoint=candidate;
+                break;
+            }
+            Transform evacuation=Models.Node(arenaContents,"Extraction zone",World(evacuationPoint,.045f));
+            for(int i=0;i<24;i++)
+            {
+                float angle=i*Mathf.PI/12;
+                Transform stripe=Models.Block(evacuation,"Landing stripe",
+                    new Vector3(Mathf.Sin(angle)*3.6f,0,Mathf.Cos(angle)*3.6f),.55f,.06f,.17f,
+                    i%2==0?"A4F0CA":"E9F1CD");
+                stripe.localRotation=Quaternion.Euler(0,angle*Mathf.Rad2Deg,0);
+                Models.VisualOnly(stripe);
+            }
+            Drop(evacuationPoint,Random.Range(4,Weapons.Length),44,20);
+            raidTimer=1;
+            Sound("wave");
+            Announce("Эвакуационная зона открыта");
         }
 
         private bool FindSupply(out Vector2 point)
@@ -468,9 +569,9 @@ namespace Zone04
         private void Spawn(EnemyKind kind,Vector2 point)
         {
             int variant=(int)kind;
-            float[] health={1,.62f,1.55f,.84f,1.02f,6.7f};
-            float[] velocity={2.6f,4.9f,2.05f,2.62f,2.54f,3.36f};
-            float[] radii={.40f,.35f,.49f,.41f,.42f,.69f};
+            float[] health={1,.62f,1.55f,.84f,1.02f,6.7f,1.18f};
+            float[] velocity={2.6f,4.9f,2.05f,2.62f,2.54f,3.36f,3.7f};
+            float[] radii={.40f,.35f,.49f,.41f,.42f,.69f,.51f};
             var e=new Enemy { Kind=kind, Position=point, Direction=Vector2.up,
                 Hp=(33+wave*5)*(.88f+difficulty*.24f)*health[variant],
                 Speed=velocity[variant]*(.93f+.115f*difficulty),Radius=radii[variant] };
@@ -492,18 +593,36 @@ namespace Zone04
                 bool clear=map.FirstCover(e.Position,position)>=1;
                 float reach=e.Kind==EnemyKind.Boss?2.2f:1.08f;
                 bool ranged=e.Kind==EnemyKind.Spitter;
+                bool charging=e.Kind==EnemyKind.Charger || e.Kind==EnemyKind.Boss;
                 bool canCall=e.Kind==EnemyKind.Caller && !e.Called && enemies.Count<66;
                 e.Cooldown=Mathf.Max(0,e.Cooldown-dt);
                 e.Swing=Mathf.Max(0,e.Swing-dt*5f);
                 Vector2 previous=e.Position;
-                if(e.Windup>0)
+                if(e.Charge>0)
+                {
+                    e.Charge-=dt;
+                    float stride=(e.Kind==EnemyKind.Boss?13f:17f)*dt;
+                    Vector2 next=e.Position+e.Direction*stride;
+                    if(map.FirstCover(e.Position,next,e.Radius)<1 || map.Blocked(next,e.Radius))
+                        e.Charge=0;
+                    else
+                        e.Position=next;
+                    if(Vector2.Distance(position,e.Position)<=reach && map.FirstCover(e.Position,position)>=1)
+                    {
+                        e.Charge=0;
+                        Hurt(e.Kind==EnemyKind.Boss?28:21);
+                    }
+                }
+                else if(e.Windup>0)
                 {
                     e.Windup-=dt;
                     if(e.Windup<=0)
                     {
                         e.Swing=1;
-                        e.Cooldown=ranged?2.4f:e.Kind==EnemyKind.Boss?1.35f:.82f;
-                        if(ranged)
+                        e.Cooldown=ranged?2.4f:charging?2.45f:.82f;
+                        if(charging)
+                            e.Charge=.39f;
+                        else if(ranged)
                         {
                             AddProjectile(e.Position,e.Aim,11.8f,13,14,true);
                             Sound("spit",.7f);
@@ -524,16 +643,16 @@ namespace Zone04
                             Hurt(e.Kind==EnemyKind.Boss?28:e.Kind==EnemyKind.Armored?16:10);
                     }
                 }
-                else if(e.Cooldown<=0 && clear && gap<=(ranged?10:canCall?8:reach))
+                else if(e.Cooldown<=0 && clear && gap<=(ranged?10:canCall?8:charging?6.3f:reach))
                 {
-                    e.Windup=ranged?.58f:canCall?.72f:e.Kind==EnemyKind.Boss?.68f:.29f;
+                    e.Windup=ranged?.58f:canCall?.72f:charging?.59f:.29f;
                     e.Aim=toPlayer.normalized;
                     if(e.Aim.sqrMagnitude<.01f) e.Aim=e.Direction;
                     e.Direction=e.Aim;
                 }
                 else if(!clear || gap>(ranged?6.6f:reach*.8f))
                 {
-                    Vector2 point=map.Pursuit(e.Position,position,e.Radius);
+                    Vector2 point=map.Guide(e.Position,position,e.Radius);
                     Vector2 direction=(point-e.Position).normalized;
                     if((point-position).sqrMagnitude<.01f)
                     {
@@ -545,18 +664,14 @@ namespace Zone04
                                 direction+=away*1.35f;
                         }
                     }
-                    e.Position=map.Move(e.Position,direction.normalized*e.Speed*dt,e.Radius);
-                    if((e.Position-previous).sqrMagnitude>.00001f) e.Direction=direction.normalized;
-                    e.Stuck=(e.Position-previous).sqrMagnitude<.000001f?e.Stuck+dt:0;
-                    if(e.Stuck>1.5f && FindSpawn(out Vector2 openPosition))
-                    {
-                        e.Position=openPosition;
-                        e.Stuck=0;
-                    }
+                    float stride=Mathf.Min(e.Speed*dt,Vector2.Distance(e.Position,point));
+                    e.Position=map.Move(e.Position,direction.normalized*stride,e.Radius);
+                    if((e.Position-previous).sqrMagnitude>.00001f)
+                        e.Direction=(e.Position-previous).normalized;
                 }
                 e.Model.Root.position=World(e.Position);
                 e.Model.Animate(dt,Mathf.Clamp01((e.Position-previous).magnitude/(dt*e.Speed+.001f)),
-                    Yaw(e.Direction),0,0,e.Windup>0?-.31f:e.Swing,0,0);
+                    Yaw(e.Direction),0,e.Charge>0?.77f:0,e.Windup>0?-.31f:e.Swing,0,0);
                 if(state==ScreenState.Defeat) return;
             }
             foreach(Vector2 p in reinforcements) Spawn(EnemyKind.Runner,p);
@@ -574,11 +689,18 @@ namespace Zone04
 
         private void Hurt(float amount)
         {
+            if(hurtFlash>.10f) return;
+            hurtFlash=.24f;
             Sound("hit");
             hp=Mathf.Max(0,hp-amount*(.78f+.28f*difficulty)*armor);
             if(hp>0) return;
             state=ScreenState.Defeat;
-            player.Animate(0,0,bodyYaw,aimYaw,0,0,0,0,true);
+            fallTime=0;
+            SaveBest();
+        }
+
+        private void SaveBest()
+        {
             if(kills<=best) return;
             best=kills;
             PlayerPrefs.SetInt("Zone04.Best",best);
@@ -614,7 +736,7 @@ namespace Zone04
             Sound("pickup");
             int collected = s.Ammo;
             ammo+=collected;
-            hp=Mathf.Min(100,hp+s.Heal);
+            hp=Mathf.Min(maxHp,hp+s.Heal);
             s.Ammo=0;
             s.Heal=0;
             if(equip)
@@ -659,20 +781,27 @@ namespace Zone04
             {
                 case 0: damage+=.25f; break;
                 case 1: speed+=.12f; break;
-                case 2: hp=Mathf.Min(100,hp+35); break;
+                case 2: hp=Mathf.Min(maxHp,hp+35); break;
                 case 3: ammo+=55; break;
                 case 4: armor*=.85f; break;
                 case 5: reloadMultiplier*=.8f; break;
                 case 6: dashCooldown*=.8f; break;
                 case 7: bonusMagazine+=4; break;
+                case 8: maxHp+=20; hp+=20; break;
+                case 9: rangeBoost+=.25f; break;
+                case 10: shotRate+=.15f; break;
             }
-            state=ScreenState.Playing;
+            suppressShotUntilRelease=true;
+            if(xp>=XpGoal) OfferUpgrade();
+            else state=ScreenState.Playing;
         }
 
         private void Announce(string line) { notice=line; noticeUntil=elapsed+2.6f; }
 
         private void SetDisplay(bool full)
         {
+            displayGrace=Time.unscaledTime+.35f;
+            suppressShotUntilRelease=true;
             Screen.fullScreenMode=full ? FullScreenMode.FullScreenWindow : FullScreenMode.Windowed;
             PlayerPrefs.SetInt("Zone04.Fullscreen",full?1:0);
             PlayerPrefs.Save();
@@ -719,7 +848,7 @@ namespace Zone04
 
         private void OnGUI()
         {
-            if (view==null) return;
+            if (view==null || Screen.width<1 || Screen.height<1) return;
             Skin();
             float scale=Mathf.Min(Screen.width/1080f,Screen.height/720f);
             float w=Screen.width/scale,h=Screen.height/scale;
@@ -729,6 +858,18 @@ namespace Zone04
                 Fill(new Rect(0,0,w,h),new Color(.06f,.13f,.19f,.31f));
                 DrawTitle(h);
                 return;
+            }
+            if (state==ScreenState.Playing && Event.current.type==EventType.Repaint)
+            {
+                DrawThreats(scale);
+                if(hurtFlash>0)
+                {
+                    var flash=new Color(.67f,.11f,.08f,hurtFlash*1.7f);
+                    Fill(new Rect(0,0,w,7),flash);
+                    Fill(new Rect(0,h-7,w,7),flash);
+                    Fill(new Rect(0,0,7,h),flash);
+                    Fill(new Rect(w-7,0,7,h),flash);
+                }
             }
             DrawHud(w,h);
             if (state==ScreenState.Playing)
@@ -745,10 +886,44 @@ namespace Zone04
             else DrawPause(w,h);
         }
 
+        private Vector2 Project(Vector2 location,float height,float scale)
+        {
+            Vector3 p=view.WorldToScreenPoint(World(location,height));
+            return new Vector2(p.x/scale,(Screen.height-p.y)/scale);
+        }
+
+        private void DrawThreats(float scale)
+        {
+            foreach(Enemy e in enemies)
+            {
+                Vector2 point=Project(e.Position,e.Kind==EnemyKind.Boss?2.8f:2.1f,scale);
+                if(point.x<-100||point.x>Screen.width/scale+100||point.y<-100||point.y>Screen.height/scale+100)
+                    continue;
+                Color warning=e.Kind==EnemyKind.Spitter?Models.Tint("B8F779"):
+                    e.Kind==EnemyKind.Caller?Models.Tint("F7B3F7"):Gold;
+                if(e.Kind==EnemyKind.Boss || e.Hp<e.MaxHp)
+                    Meter(new Rect(point.x-(e.Kind==EnemyKind.Boss?38:18),point.y-7,
+                        e.Kind==EnemyKind.Boss?76:36,4),e.Hp/e.MaxHp,Models.Tint("F39C8C"));
+                if(e.Windup<=0) continue;
+                bool ranged=e.Kind==EnemyKind.Spitter || e.Kind==EnemyKind.Charger || e.Kind==EnemyKind.Boss;
+                Vector2 begin=Project(e.Position,.12f,scale);
+                if(ranged)
+                {
+                    Vector2 end=Project(e.Position+e.Aim*(e.Kind==EnemyKind.Spitter?5.5f:3.8f),.12f,scale);
+                    Vector2 delta=end-begin;
+                    Matrix4x4 old=GUI.matrix;
+                    GUIUtility.RotateAroundPivot(Mathf.Atan2(delta.y,delta.x)*Mathf.Rad2Deg,begin);
+                    Fill(new Rect(begin.x,begin.y-1.5f,delta.magnitude,3),warning);
+                    GUI.matrix=old;
+                }
+                Fill(new Rect(point.x-4,point.y-20,8,8),warning);
+            }
+        }
+
         private void DrawTitle(float h)
         {
-            float x=40,y=(h-514)/2;
-            Panel(new Rect(x,y,504,514),Gold);
+            float x=40,y=(h-566)/2;
+            Panel(new Rect(x,y,504,566),Gold);
             GUI.Label(new Rect(x+28,y+29,445,82),"ЗОНА 04",headline);
             GUI.Label(new Rect(x+32,y+120,436,28),"ОДИН ПРОТИВ ОРДЫ",text);
             GUI.Label(new Rect(x+32,y+171,436,26),"Сложность",small);
@@ -766,12 +941,19 @@ namespace Zone04
                 }
                 GUI.color=old;
             }
-            if(GUI.Button(new Rect(x+32,y+267,440,53),"1   Классическая карта",button)) StartMatch(false);
-            if(GUI.Button(new Rect(x+32,y+329,440,53),"2   Случайная карта",button)) StartMatch(true);
-            if(GUI.Button(new Rect(x+32,y+400,214,38),"Режим экрана · F11",button))
+            if(GUI.Button(new Rect(x+32,y+252,440,43),
+                extractionEnabled?"Задача: эвакуация после 5 волн":"Задача: бесконечное выживание",button))
+            {
+                extractionEnabled=!extractionEnabled;
+                PlayerPrefs.SetInt("Zone04.Extraction",extractionEnabled?1:0);
+                PlayerPrefs.Save();
+            }
+            if(GUI.Button(new Rect(x+32,y+311,440,53),"1   Классическая карта",button)) StartMatch(false);
+            if(GUI.Button(new Rect(x+32,y+372,440,53),"2   Случайная карта",button)) StartMatch(true);
+            if(GUI.Button(new Rect(x+32,y+443,214,38),"Режим экрана · F11",button))
                 SetDisplay(Screen.fullScreenMode==FullScreenMode.Windowed);
-            if(GUI.Button(new Rect(x+258,y+400,214,38),"Выйти",button)) Application.Quit();
-            GUI.Label(new Rect(x+32,y+464,440,24),"WASD — движение    ЛКМ — огонь    Пробел — рывок",small);
+            if(GUI.Button(new Rect(x+258,y+443,214,38),"Выйти",button)) Application.Quit();
+            GUI.Label(new Rect(x+32,y+514,440,24),"WASD — движение    ЛКМ — огонь    Пробел — рывок",small);
         }
 
         private void DrawHud(float w,float h)
@@ -785,12 +967,25 @@ namespace Zone04
             string waveLabel=remaining+enemies.Count>0 ? $"Волна {wave:00}" : $"До волны {wave+1:00} · {Mathf.CeilToInt(rest)} с";
             GUI.Label(new Rect(x+16,33,252,28),waveLabel,text);
             GUI.Label(new Rect(x+16,64,254,25),$"Врагов {remaining+enemies.Count}  ·  Устранено {kills}",small);
-            if(elapsed<noticeUntil)
+            if(extraction!=null)
+            {
+                bool open=extraction.Open;
+                Panel(new Rect(x,110,286,63),Mint);
+                string goal=open ? $"Эвакуация · {extraction.Remaining:0.0} с" : $"Эвакуация после волны {ExtractionMission.RequiredWaves}";
+                GUI.Label(new Rect(x+12,117,264,26),goal,text);
+                if(open)
+                {
+                    float distance=Vector2.Distance(position,evacuationPoint);
+                    GUI.Label(new Rect(x+12,143,264,22),distance<=3.6f?"Удерживай зону":$"До зоны {distance:0} м",small);
+                    Meter(new Rect(x+12,165,262,4),1-extraction.Remaining/ExtractionMission.RequiredSeconds,Mint);
+                }
+            }
+            else if(elapsed<noticeUntil)
                 GUI.Label(new Rect(x,107,288,27),notice,text);
 
             Panel(new Rect(22,h-105,244,83),hp<32?Models.Tint("F29288"):Mint);
-            GUI.Label(new Rect(36,h-94,210,28),$"Здоровье {Mathf.CeilToInt(hp)} / 100",text);
-            Meter(new Rect(36,h-53,214,6),hp/100,Mint);
+            GUI.Label(new Rect(36,h-94,210,28),$"Здоровье {Mathf.CeilToInt(hp)} / {Mathf.CeilToInt(maxHp)}",text);
+            Meter(new Rect(36,h-53,214,6),hp/maxHp,Mint);
 
             Panel(new Rect(x,h-105,286,83),Mint);
             GUI.Label(new Rect(x+16,h-95,254,27),$"Уровень {level} · Опыт {xp}/{XpGoal}",text);
@@ -821,6 +1016,11 @@ namespace Zone04
             Panel(r,Mint);
             GUI.Label(new Rect(r.x+10,r.y+8,133,22),"КАРТА  /  ESC ПАУЗА",small);
             Fill(new Rect(r.x+10,r.y+36,133,125),Models.Tint("34485A"));
+            foreach(Rect cover in map.CoverAreas)
+                Fill(new Rect(r.x+76+cover.x*1.42f,r.y+98-cover.yMax*1.31f,
+                    cover.width*1.42f,cover.height*1.31f),Models.Tint("637387"));
+            if(extraction!=null && extraction.Open)
+                Fill(new Rect(r.x+73+evacuationPoint.x*1.42f,r.y+95-evacuationPoint.y*1.31f,7,7),Gold);
             foreach(Enemy enemy in enemies)
             {
                 float x=r.x+76+enemy.Position.x*1.42f,y=r.y+98-enemy.Position.y*1.31f;
@@ -850,13 +1050,18 @@ namespace Zone04
         {
             float x=w/2-245,y=h/2-184;
             Panel(new Rect(x,y,490,368),Gold);
-            bool lost=state==ScreenState.Defeat;
-            GUI.Label(new Rect(x+24,y+23,444,83),lost?"ТЫ ПОГИБ":"ПАУЗА",headline);
+            bool finished=state==ScreenState.Defeat || state==ScreenState.Victory;
+            string title=state==ScreenState.Victory?"ТЫ ВЫЖИЛ":finished?"ТЫ ПОГИБ":"ПАУЗА";
+            GUI.Label(new Rect(x+24,y+23,444,83),title,headline);
             GUI.Label(new Rect(x+27,y+111,438,35),$"Волна {wave}  ·  Устранено {kills}  ·  Рекорд {best}",small);
-            if(GUI.Button(new Rect(x+26,y+157,438,47),lost?"Сыграть снова":"Продолжить",button))
+            if(GUI.Button(new Rect(x+26,y+157,438,47),finished?"Сыграть снова":"Продолжить",button))
             {
-                if(lost) StartMatch(generated);
-                else state=ScreenState.Playing;
+                if(finished) StartMatch(generated);
+                else
+                {
+                    suppressShotUntilRelease=true;
+                    state=ScreenState.Playing;
+                }
             }
             if(GUI.Button(new Rect(x+26,y+216,212,42),"Режим экрана",button))
                 SetDisplay(Screen.fullScreenMode==FullScreenMode.Windowed);
@@ -876,6 +1081,7 @@ namespace Zone04
             }
             if(GUI.Button(new Rect(x+26,y+311,438,42),"Главное меню",button))
             {
+                SaveBest();
                 StartMatch(generated);
                 state=ScreenState.Title;
                 FocusCamera(position-Vector2.right*4,true);
