@@ -109,6 +109,13 @@ namespace Zone04
                         new Vector3(.98f,.95f,1.42f),i%2==0?"83A957":"68904C");
         }
 
+        public void RegisterTerminal(Vector2 center)
+        {
+            obstacles.Add(new Rect(center.x-.62f,center.y-.62f,1.24f,1.24f));
+            regularRoutes=null;
+            heavyRoutes=null;
+        }
+
         public bool Blocked(Vector2 point, float margin)
         {
             if (Mathf.Abs(point.x)>Edge-margin || Mathf.Abs(point.y)>Edge-margin) return true;

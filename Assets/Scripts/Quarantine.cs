@@ -3,9 +3,9 @@ using UnityEngine;
 
 namespace Zone04
 {
-    public sealed class Quarantine : MonoBehaviour
+    public sealed partial class Quarantine : MonoBehaviour
     {
-        private enum ScreenState { Title, Playing, Pause, Upgrade, Defeat, Victory }
+        private enum ScreenState { Title, Playing, Pause, Defeat, Victory }
         private enum EnemyKind { Walker, Runner, Armored, Spitter, Caller, Boss, Charger }
 
         private sealed class Enemy
@@ -13,7 +13,7 @@ namespace Zone04
             public EnemyKind Kind;
             public ActorModel Model;
             public Vector2 Position, Direction, Aim;
-            public float Hp, MaxHp, Armor, Speed, Radius, Windup, Cooldown, Swing, Charge;
+            public float Hp, MaxHp, Armor, Speed, Radius, Windup, Cooldown, Swing, Charge, NextHitCredit;
             public bool Called;
         }
 
@@ -29,7 +29,7 @@ namespace Zone04
         {
             public Transform Model;
             public Vector2 Position;
-            public int Ammo, Weapon;
+            public int Ammo;
             public float Heal;
         }
 
@@ -54,19 +54,6 @@ namespace Zone04
             new("Ручной пулемёт",48,1,20,.11f,2.35f,47,30),
             new("Марксманская винтовка",6,1,83,.75f,1.48f,66,44)
         };
-        private static readonly string[] Upgrades =
-        {
-            "Усиленные патроны", "Лёгкое снаряжение", "Аптечка", "Запас патронов",
-            "Бронежилет", "Быстрые руки", "Быстрый рывок", "Длинные магазины",
-            "Второе дыхание", "Дальнобойные пули", "Тренировка стрельбы"
-        };
-        private static readonly string[] UpgradeDetails =
-        {
-            "+25% урона", "+12% к скорости бега", "+35 здоровья", "+55 патронов",
-            "−15% получаемого урона", "−20% времени перезарядки", "−20% отката рывка", "+4 патрона в магазине",
-            "+20 к максимуму здоровья", "+25% к дальности", "+15% темпа огня"
-        };
-
         private Camera view;
         private AudioSource audioPlayer;
         private readonly Dictionary<string,AudioClip> audioClips=new();
@@ -77,17 +64,19 @@ namespace Zone04
         private readonly List<Enemy> enemies=new();
         private readonly List<Projectile> shots=new();
         private readonly List<Supply> supplies=new();
-        private readonly List<int> choices=new();
         private ScreenState state;
         private bool generated, extractionEnabled;
         private ExtractionMission extraction;
         private Vector2 evacuationPoint;
-        private float raidTimer, hurtFlash, maxHp, rangeBoost, shotRate, fallTime;
+        private float raidTimer, hurtFlash, maxHp, fallTime;
         private bool suppressShotUntilRelease;
         private float displayGrace;
-        private int difficulty=1, wave, remaining, kills, xp, level, best, weaponId, magazine, ammo, bonusMagazine;
+        private int difficulty=1, wave, remaining, kills, best, weaponId, magazine, ammo;
         private float hp, spawnTimer, rest, shotTimer, reloadTimer, elapsed, dashReady, dashTime;
-        private float damage, speed, armor, reloadMultiplier, dashCooldown, bodyYaw, aimYaw, recoil;
+        private float speed, armor, dashCooldown, bodyYaw, aimYaw, recoil;
+        private int MagazineCapacity => Weapons[weaponId].Capacity + economy.Tier(weaponId)*3;
+        private float ReloadDuration => Weapons[weaponId].Reload * (quickHands ? .74f : 1) *
+            (1-economy.Tier(weaponId)*.05f);
         private Vector2 position, dashStart, dashDirection, aim=Vector2.up;
         private float dashLength;
         private bool showMap=true;
@@ -171,12 +160,12 @@ namespace Zone04
             extraction=extractionEnabled ? new ExtractionMission() : null;
             raidTimer=hurtFlash=fallTime=0;
             suppressShotUntilRelease=true;
-            rangeBoost=shotRate=1;
             enemies.Clear(); shots.Clear(); supplies.Clear();
-            wave=remaining=kills=xp=bonusMagazine=weaponId=0;
-            level=1; maxHp=hp=100; magazine=18; ammo=108;
+            wave=remaining=kills=weaponId=0;
+            maxHp=hp=100; magazine=18; ammo=78;
+            SetupStations();
             rest=3; spawnTimer=shotTimer=reloadTimer=elapsed=dashReady=dashTime=0;
-            damage=speed=armor=reloadMultiplier=1;
+            speed=armor=1;
             dashCooldown=2.4f;
             position=Vector2.zero;
             bodyYaw=aimYaw=0;
@@ -201,11 +190,6 @@ namespace Zone04
             {
                 suppressShotUntilRelease=true;
                 state=ScreenState.Playing;
-            }
-            else if (state==ScreenState.Upgrade)
-            {
-                for (int i=0;i<3;i++)
-                    if (Input.GetKeyDown((KeyCode)((int)KeyCode.Alpha1+i))) Choose(i);
             }
             else if ((state==ScreenState.Defeat || state==ScreenState.Victory) && Input.GetKeyDown(KeyCode.Return))
                 StartMatch(generated);
@@ -299,16 +283,21 @@ namespace Zone04
                 reloadTimer-=dt;
                 if (reloadTimer<=0)
                 {
-                    int amount=Mathf.Min(ammo,Weapons[weaponId].Capacity+bonusMagazine-magazine);
+                    int amount=Mathf.Min(ammo,MagazineCapacity-magazine);
                     magazine+=amount; ammo-=amount;
                 }
             }
             if (Input.GetKeyDown(KeyCode.R)) Reload();
             if (Input.GetMouseButton(0) && !suppressShotUntilRelease && !dashing && reloadTimer<=0 && shotTimer<=0)
                 TryFire();
-            if (Input.GetKeyDown(KeyCode.E)) Collect(false);
-            if (Input.GetKeyDown(KeyCode.F)) Collect(true);
-            float reloadPose=reloadTimer>0 ? Mathf.Sin(Mathf.PI*reloadTimer/(Weapons[weaponId].Reload*reloadMultiplier)) : 0;
+            if (Input.GetKeyDown(KeyCode.E))
+            {
+                Station station=NearbyStation();
+                if(station!=null) Purchase(station);
+                else Collect();
+            }
+            else if (Input.GetKeyDown(KeyCode.F)) Collect();
+            float reloadPose=reloadTimer>0 ? Mathf.Sin(Mathf.PI*reloadTimer/ReloadDuration) : 0;
             player.Animate(dt,Mathf.Clamp01((position-previous).magnitude/(dt*6.4f+.001f)),bodyYaw,aimYaw,dashPose,0,recoil,reloadPose);
             FocusCamera(position);
             UpdateWave(dt);
@@ -327,7 +316,6 @@ namespace Zone04
                     return;
                 }
             }
-            if(xp>=XpGoal) OfferUpgrade();
         }
 
         private void Dash(Vector2 direction)
@@ -346,10 +334,9 @@ namespace Zone04
 
         private void Reload()
         {
-            Weapon w=Weapons[weaponId];
-            if (reloadTimer<=0 && ammo>0 && magazine<w.Capacity+bonusMagazine)
+            if (reloadTimer<=0 && ammo>0 && magazine<MagazineCapacity)
             {
-                reloadTimer=w.Reload*reloadMultiplier;
+                reloadTimer=ReloadDuration;
                 Sound("reload");
             }
         }
@@ -360,14 +347,15 @@ namespace Zone04
             Weapon w=Weapons[weaponId];
             magazine--;
             Sound("shot",.8f);
-            shotTimer=w.Delay/shotRate;
+            shotTimer=w.Delay;
+            int tier=economy.Tier(weaponId);
             recoil=1;
             for (int i=0;i<w.Pellets;i++)
             {
                 float spread=w.Pellets==1 ? 0 : (i-(w.Pellets-1)*.5f)*.075f;
                 Vector2 direction=new(aim.x*Mathf.Cos(spread)+aim.y*Mathf.Sin(spread),
                     aim.y*Mathf.Cos(spread)-aim.x*Mathf.Sin(spread));
-                AddProjectile(position,direction,w.Speed,w.Reach*rangeBoost,w.Damage*damage,false);
+                AddProjectile(position,direction,w.Speed,w.Reach*(1+.12f*tier),w.Damage*(1+.33f*tier),false);
             }
         }
 
@@ -418,6 +406,11 @@ namespace Zone04
                         target.Armor-=blocked;
                         target.Hp-=shot.Damage-blocked;
                         if(target.Hp<=0) Kill(target);
+                        else if(elapsed>=target.NextHitCredit)
+                        {
+                            economy.Credit(10);
+                            target.NextHitCredit=elapsed+.19f;
+                        }
                     }
                 }
                 shot.Life-=travel;
@@ -477,7 +470,10 @@ namespace Zone04
                 rest=5-difficulty;
                 spawnTimer=0;
                 if(wave>1 && FindSupply(out Vector2 point))
-                    Drop(point,wave%2==0?1+(wave/2-1)%(Weapons.Length-1):-1,38,16);
+                {
+                    economy.Credit(100);
+                    Drop(point, wave%2==0?25:17, 10);
+                }
                 Announce(wave%5==0 ? "Волна "+wave+" — громила" : "Волна "+wave);
             }
         }
@@ -548,7 +544,7 @@ namespace Zone04
                 stripe.localRotation=Quaternion.Euler(0,angle*Mathf.Rad2Deg,0);
                 Models.VisualOnly(stripe);
             }
-            Drop(evacuationPoint,Random.Range(4,Weapons.Length),44,20);
+            Drop(evacuationPoint,44,20);
             raidTimer=1;
             Sound("wave");
             Announce("Эвакуационная зона открыта");
@@ -682,9 +678,10 @@ namespace Zone04
             enemies.Remove(e);
             Destroy(e.Model.Root.gameObject);
             kills++;
-            xp+=e.Kind==EnemyKind.Boss?5:1;
-            if(e.Kind==EnemyKind.Boss || kills%3==0)
-                Drop(e.Position,-1,e.Kind==EnemyKind.Boss?62:12,e.Kind==EnemyKind.Boss?24:0);
+            bool boss=e.Kind==EnemyKind.Boss;
+            economy.Credit(boss?450:e.Kind==EnemyKind.Armored || e.Kind==EnemyKind.Charger?85:65);
+            if(boss || kills%6==0)
+                Drop(e.Position,boss?45:9,boss?24:0);
         }
 
         private void Hurt(float amount)
@@ -707,21 +704,20 @@ namespace Zone04
             PlayerPrefs.Save();
         }
 
-        private void Drop(Vector2 p,int weapon,int rounds,float heal)
+        private void Drop(Vector2 p,int rounds,float heal)
         {
-            Transform model=Models.Block(arenaContents,weapon>=0?"Weapon cache":"Supplies",World(p,.25f),
-                .78f,.49f,.63f,weapon>=0?"DDBB60":heal>0?"82C681":"AF9263");
+            Transform model=Models.Block(arenaContents,"Supplies",World(p,.25f),
+                .78f,.49f,.63f,heal>0?"82C681":"AF9263");
             Models.Block(model,"Lid band",new Vector3(0,.24f,0),.14f,.025f,.61f,"E4EAD4");
-            supplies.Add(new Supply { Model=model, Position=p, Ammo=rounds, Weapon=weapon, Heal=heal });
+            supplies.Add(new Supply { Model=model, Position=p, Ammo=rounds, Heal=heal });
         }
 
-        private Supply Nearby(bool weapon)
+        private Supply NearbySupply()
         {
             float nearest=2;
             Supply result=null;
             foreach(Supply s in supplies)
             {
-                if(weapon ? s.Weapon<0 : s.Ammo==0 && s.Heal==0) continue;
                 float gap=Vector2.Distance(position,s.Position);
                 if(gap>=nearest || map.FirstCover(position,s.Position)<1) continue;
                 nearest=gap; result=s;
@@ -729,71 +725,23 @@ namespace Zone04
             return result;
         }
 
-        private void Collect(bool equip)
+        private void Collect()
         {
-            Supply s=Nearby(equip);
+            Supply s=NearbySupply();
             if(s==null) return;
-            Sound("pickup");
-            int collected = s.Ammo;
-            ammo+=collected;
-            hp=Mathf.Min(maxHp,hp+s.Heal);
-            s.Ammo=0;
-            s.Heal=0;
-            if(equip)
+            if((ammo>=MaxReserve || s.Ammo==0) && (hp>=maxHp || s.Heal==0))
             {
-                int previous=weaponId;
-                weaponId=s.Weapon;
-                s.Weapon=previous;
-                s.Ammo=magazine;
-                magazine=0;
-                reloadTimer=0;
-                player.Equip(weaponId);
-                Reload();
-                Announce(Weapons[weaponId].Name);
+                Announce("Запасы полны");
+                return;
             }
-            else if(collected>0)
-                Announce("Припасы · +"+collected+" патронов");
-            else
-                Announce("Здоровье восстановлено");
-            if(s.Weapon>=0) return;
+            Sound("pickup");
+            int gained=Mathf.Min(MaxReserve-ammo,s.Ammo);
+            ammo+=gained;
+            float healed=Mathf.Min(maxHp-hp,s.Heal);
+            hp+=healed;
+            Announce("Припасы  ·  +"+gained+" патронов  ·  +"+Mathf.CeilToInt(healed)+" здоровья");
             Destroy(s.Model.gameObject);
             supplies.Remove(s);
-        }
-
-        private int XpGoal => 5+3*(level-1);
-
-        private void OfferUpgrade()
-        {
-            xp-=XpGoal;
-            level++;
-            choices.Clear();
-            while(choices.Count<3)
-            {
-                int next=Random.Range(0,Upgrades.Length);
-                if(!choices.Contains(next)) choices.Add(next);
-            }
-            state=ScreenState.Upgrade;
-        }
-
-        private void Choose(int i)
-        {
-            switch(choices[i])
-            {
-                case 0: damage+=.25f; break;
-                case 1: speed+=.12f; break;
-                case 2: hp=Mathf.Min(maxHp,hp+35); break;
-                case 3: ammo+=55; break;
-                case 4: armor*=.85f; break;
-                case 5: reloadMultiplier*=.8f; break;
-                case 6: dashCooldown*=.8f; break;
-                case 7: bonusMagazine+=4; break;
-                case 8: maxHp+=20; hp+=20; break;
-                case 9: rangeBoost+=.25f; break;
-                case 10: shotRate+=.15f; break;
-            }
-            suppressShotUntilRelease=true;
-            if(xp>=XpGoal) OfferUpgrade();
-            else state=ScreenState.Playing;
         }
 
         private void Announce(string line) { notice=line; noticeUntil=elapsed+2.6f; }
@@ -862,6 +810,7 @@ namespace Zone04
             if (state==ScreenState.Playing && Event.current.type==EventType.Repaint)
             {
                 DrawThreats(scale);
+                DrawStationSigns(scale);
                 if(hurtFlash>0)
                 {
                     var flash=new Color(.67f,.11f,.08f,hurtFlash*1.7f);
@@ -882,8 +831,7 @@ namespace Zone04
                 return;
             }
             Fill(new Rect(0,0,w,h),new Color(.03f,.08f,.14f,.71f));
-            if (state==ScreenState.Upgrade) DrawUpgrade(w,h);
-            else DrawPause(w,h);
+            DrawPause(w,h);
         }
 
         private Vector2 Project(Vector2 location,float height,float scale)
@@ -953,14 +901,14 @@ namespace Zone04
             if(GUI.Button(new Rect(x+32,y+443,214,38),"Режим экрана · F11",button))
                 SetDisplay(Screen.fullScreenMode==FullScreenMode.Windowed);
             if(GUI.Button(new Rect(x+258,y+443,214,38),"Выйти",button)) Application.Quit();
-            GUI.Label(new Rect(x+32,y+514,440,24),"WASD — движение    ЛКМ — огонь    Пробел — рывок",small);
+            GUI.Label(new Rect(x+32,y+514,440,24),"WASD — движение    ЛКМ — огонь    E — покупка",small);
         }
 
         private void DrawHud(float w,float h)
         {
             Panel(new Rect(22,22,240,78),Mint);
             GUI.Label(new Rect(36,33,208,28),"ЗОНА 04",text);
-            GUI.Label(new Rect(36,64,208,25),generated?"Случайная карта":"Классическая карта",small);
+            GUI.Label(new Rect(36,64,208,25),economy.Powered?"Питание подано":"Питание отключено",small);
 
             float x=w/2-143;
             Panel(new Rect(x,22,286,78),Gold);
@@ -980,34 +928,45 @@ namespace Zone04
                     Meter(new Rect(x+12,165,262,4),1-extraction.Remaining/ExtractionMission.RequiredSeconds,Mint);
                 }
             }
-            else if(elapsed<noticeUntil)
-                GUI.Label(new Rect(x,107,288,27),notice,text);
+            if(elapsed<noticeUntil)
+                GUI.Label(new Rect(x-90,extraction==null?107:177,466,27),notice,small);
 
             Panel(new Rect(22,h-105,244,83),hp<32?Models.Tint("F29288"):Mint);
             GUI.Label(new Rect(36,h-94,210,28),$"Здоровье {Mathf.CeilToInt(hp)} / {Mathf.CeilToInt(maxHp)}",text);
             Meter(new Rect(36,h-53,214,6),hp/maxHp,Mint);
 
             Panel(new Rect(x,h-105,286,83),Mint);
-            GUI.Label(new Rect(x+16,h-95,254,27),$"Уровень {level} · Опыт {xp}/{XpGoal}",text);
-            Meter(new Rect(x+16,h-64,254,4),xp/(float)XpGoal,Mint);
+            GUI.Label(new Rect(x+16,h-95,254,27),$"ОЧКИ  {economy.Points:N0}",text);
+            Fill(new Rect(x+16,h-64,254,2),economy.Powered?Mint:Gold);
             string dash=elapsed>=dashReady?"Пробел · Рывок готов":$"Рывок через {dashReady-elapsed:0.0} с";
             GUI.Label(new Rect(x+16,h-58,248,23),dash,small);
 
             x=w-300;
             Panel(new Rect(x,h-105,278,83),Gold);
-            GUI.Label(new Rect(x+16,h-96,241,26),Weapons[weaponId].Name,small);
+            GUI.Label(new Rect(x+16,h-96,241,26),Weapons[weaponId].Name+
+                (economy.Tier(weaponId)>0?" · МК "+economy.Tier(weaponId):""),small);
             GUI.Label(new Rect(x+16,h-69,241,31),reloadTimer>0?"Перезарядка":$"{magazine:00} / {ammo:000}   [R]",text);
 
             if(showMap) DrawMap(w);
-            Supply supply=Nearby(false), gun=Nearby(true);
-            if(supply!=null || gun!=null)
+            Station station=NearbyStation();
+            Supply supply=NearbySupply();
+            if(station!=null || supply!=null)
             {
-                string hint=(supply!=null?"E  Подобрать припасы":"")+
-                    (gun!=null?(supply!=null?"    ·    ":"")+"F  "+Weapons[gun.Weapon].Name:"");
-                var r=new Rect(w/2-230,h-151,460,34);
+                string hint="E   Подобрать припасы";
+                if(station!=null)
+                {
+                    string unavailable=StationUnavailable(station);
+                    int cost=StationPrice(station);
+                    string detail=unavailable.Length>0?unavailable:
+                        cost+(cost>economy.Points?" очков · не хватает":" очков");
+                    hint="E   "+StationTitle(station)+"  ·  "+detail;
+                    if(supply!=null) hint+="     F  Припасы";
+                }
+                var r=new Rect(w/2-318,h-151,636,34);
                 Panel(r,Gold);
                 GUI.Label(new Rect(r.x+12,r.y+5,r.width-24,25),hint,small);
             }
+
         }
 
         private void DrawMap(float w)
@@ -1021,29 +980,15 @@ namespace Zone04
                     cover.width*1.42f,cover.height*1.31f),Models.Tint("637387"));
             if(extraction!=null && extraction.Open)
                 Fill(new Rect(r.x+73+evacuationPoint.x*1.42f,r.y+95-evacuationPoint.y*1.31f,7,7),Gold);
+            foreach(Station station in stations)
+                Fill(new Rect(r.x+75+station.Position.x*1.42f,r.y+97-station.Position.y*1.31f,
+                    3,3),station.RequiresPower && !economy.Powered?Pale:Gold);
             foreach(Enemy enemy in enemies)
             {
                 float x=r.x+76+enemy.Position.x*1.42f,y=r.y+98-enemy.Position.y*1.31f;
                 Fill(new Rect(x,y,3,3),Models.Tint("F8988B"));
             }
             Fill(new Rect(r.x+74+position.x*1.42f,r.y+96-position.y*1.31f,5,5),Mint);
-        }
-
-        private void DrawUpgrade(float w,float h)
-        {
-            float x=w/2-467,y=h/2-132;
-            Panel(new Rect(x,y,934,264),Gold);
-            GUI.Label(new Rect(x+27,y+17,880,85),"Уровень "+level,headline);
-            for(int i=0;i<3;i++)
-            {
-                int choice=choices[i];
-                float bx=x+27+i*296;
-                if(GUI.Button(new Rect(bx,y+123,278,102),(i+1)+"  "+Upgrades[choice]+"\n"+UpgradeDetails[choice],button))
-                {
-                    Choose(i);
-                    break;
-                }
-            }
         }
 
         private void DrawPause(float w,float h)

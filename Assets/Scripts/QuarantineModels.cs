@@ -166,6 +166,11 @@ namespace Zone04
                 Object.Destroy(weapon.gameObject);
             }
             weapon = Models.Node(torso,"Weapon",new Vector3(.22f,.29f,.49f));
+            BuildWeapon(weapon,index);
+        }
+
+        public static void BuildWeapon(Transform weapon,int index)
+        {
             float[] lengths={.85f,1.04f,.66f,1.14f,1.08f,1.32f};
             float length=lengths[index];
             string[] finishes = { "5C8890", "BD7B4B", "7D9B9D", "7F9C5D", "9A8A55", "6675AA" };
